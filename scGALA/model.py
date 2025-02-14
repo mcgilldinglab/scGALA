@@ -1,3 +1,4 @@
+# For Cell Alignment
 from typing import Any, Literal
 import torch
 import torch.nn as nn
@@ -83,7 +84,7 @@ class VGAE_gcl(L.LightningModule):
         z = self.model.encode(x,edge_index)
         return z
     
-from torch.nn import Sequential, Linear, ReLU, BatchNorm1d, Dropout
+from torch.nn import Linear, ReLU, BatchNorm1d, Dropout
 from torch_geometric.nn import InnerProductDecoder
 from torch_geometric.utils import (negative_sampling, remove_self_loops, add_self_loops)
 from torch import Tensor
@@ -226,8 +227,8 @@ class MSVGAE_gcl(L.LightningModule):
         
         vae_loss = self.model.recon_loss(z, edge_index) 
         reconstructed_features = self.model.liner_decoder(z)
-        decoder_loss = torch.nn.functional.mse_loss(reconstructed_features, x) * 10
-        vae_loss = vae_loss + (1 / num_nodes) * self.model.kl_loss() + decoder_loss # new line
+        decoder_loss = torch.nn.functional.mse_loss(reconstructed_features, x)
+        vae_loss = 0.5*vae_loss + 0.1*(1 / num_nodes) * self.model.kl_loss() + 0.5*decoder_loss # new line
         self.log_dict({'train_loss':float(vae_loss),'decoder_loss':float(decoder_loss)},prog_bar=True)
         return vae_loss
     def configure_optimizers(self):
@@ -418,7 +419,7 @@ class MSVGAE(torch.nn.Module):
         # use inner product decoder by default
         self.decoder = InnerProductDecoder()
         # liner decoder
-        self.liner_decoder = Sequential(
+        self.liner_decoder = nn.Sequential(
             Linear(in_features=out_dim, out_features=line_decoder_hid_dim),
             BatchNorm1d(line_decoder_hid_dim),
             ReLU(),
@@ -524,3 +525,124 @@ class MSVGAE(torch.nn.Module):
         y, pred = y.detach().cpu().numpy(), pred.detach().cpu().numpy()
 
         return roc_auc_score(y, pred), average_precision_score(y, pred)
+
+# For Multiomics Generation
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
+import pytorch_lightning as pl
+
+class GATMapper(pl.LightningModule):
+    def __init__(self, in_channels, hidden_channels, out_channels, heads=4, dropout=0.2):
+        super().__init__()
+        self.gat1 = GATConv(in_channels, hidden_channels, heads=heads, dropout=dropout)
+        self.gat2 = GATConv(hidden_channels * heads, hidden_channels, heads=heads, dropout=dropout)
+        self.gat3 = GATConv(hidden_channels * heads, out_channels, heads=1, dropout=dropout)
+        
+    def forward(self, x, edge_index, edge_attr):
+        x = F.elu(self.gat1(x, edge_index, edge_attr))
+        x = F.elu(self.gat2(x, edge_index, edge_attr))
+        x = F.relu(self.gat3(x, edge_index, edge_attr))
+        return x
+    
+    def anchor_loss(self, pred, target, anchor_map):
+        # Calculate loss only for anchor pairs
+        pred_anchor = pred[anchor_map['atac_idx']]
+        target_anchor = target[anchor_map['rna_idx']]
+        weights = anchor_map['weights']
+        
+        # Weighted MSE loss
+        loss = F.mse_loss(pred_anchor, target_anchor, reduction='none')
+        loss = (loss.mean(dim=1) * weights).mean()
+        return loss
+    
+    def training_step(self, batch, batch_idx):
+        pred = self(batch.x, batch.edge_index, batch.edge_attr)
+        loss = self.anchor_loss(pred, batch.y, batch.anchor_map)
+        self.log('train_loss', loss,prog_bar=True,batch_size=1)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        pred = self(batch.x, batch.edge_index, batch.edge_attr)
+        loss = self.anchor_loss(pred, batch.y, batch.anchor_map)
+        self.log('val_loss', loss,prog_bar=True,batch_size=1)
+        
+    def predict_step(self, batch, batch_idx):
+        pred = self(batch.x, batch.edge_index, batch.edge_attr)
+        pred = pred.cpu().numpy()
+        return pred
+        
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=0.001)
+
+# For Spatial Imputation
+from torch_geometric.nn import GCNConv,GATv2Conv,Linear,ClusterGCNConv,GATConv,AGNNConv,Sequential
+class GNNImputer(L.LightningModule):
+    def __init__(self, num_features,n_matching_genes, hidden_channels,heads=4,dropout=0.6,num_layers=3,learning_rate=1e-3,layer_type='GAT'):
+        super(GNNImputer, self).__init__()
+        if layer_type == 'GAT':
+            conv_layer = GATConv
+            GAT = True
+        elif layer_type == 'GCN':
+            conv_layer = GCNConv
+            GAT = False
+        elif layer_type == 'GATv2':
+            conv_layer = GATv2Conv
+            GAT = True
+        elif layer_type == 'ClusterGCN':
+            conv_layer = ClusterGCNConv
+            GAT = False
+        elif layer_type == 'AGNN':
+            conv_layer = AGNNConv
+            GAT = False
+        else:
+            raise ValueError(f"Invalid layer type: {layer_type}")
+        
+        self.convs_list = []
+        if GAT:
+            self.convs_list.append((conv_layer(num_features, hidden_channels, heads=heads, dropout=dropout),'x, edge_index -> x'))
+            self.convs_list.append((torch.nn.ReLU(),'x -> x'))
+            for _ in range(num_layers - 2):
+                self.convs_list.append((conv_layer(hidden_channels*heads, hidden_channels, heads=heads, dropout=dropout),'x, edge_index -> x'))
+                self.convs_list.append((torch.nn.ReLU(),'x -> x'))
+            self.convs_list.append((conv_layer(hidden_channels*heads, num_features),'x, edge_index -> x'))
+            self.convs_list.append((torch.nn.ReLU(),'x -> x'))
+        else:
+            self.convs_list.append((torch.nn.Dropout(dropout),'x -> x'))
+            self.convs_list.append((conv_layer(num_features, hidden_channels),'x, edge_index -> x'))
+            self.convs_list.append((torch.nn.ReLU(),'x -> x'))
+            for _ in range(num_layers - 2):
+                self.convs_list.append((torch.nn.Dropout(dropout),'x -> x'))
+                self.convs_list.append((conv_layer(hidden_channels, hidden_channels),'x, edge_index -> x'))
+                self.convs_list.append((torch.nn.ReLU(),'x -> x'))
+            self.convs_list.append((torch.nn.Dropout(dropout),'x -> x'))
+            self.convs_list.append((conv_layer(hidden_channels, num_features),'x, edge_index -> x'))
+            self.convs_list.append((torch.nn.ReLU(),'x -> x'))
+        self.convs = Sequential('x, edge_index',self.convs_list)
+        self.n_matching_genes = n_matching_genes
+        self.learning_rate = learning_rate
+    def forward(self, x, edge_index):
+        x = self.convs(x, edge_index)
+        return x
+    
+    def training_step(self, batch, batch_idx):
+        x, edge_index,bias = batch.x, batch.edge_index,batch.bias
+        x_hat = self(x, edge_index)
+        loss_RNA = F.mse_loss(x_hat[:bias], x[:bias])
+        loss_ST = F.mse_loss(x_hat[bias:,:self.n_matching_genes], x[bias:,:self.n_matching_genes])
+        loss = loss_RNA + loss_ST
+        self.log('train_loss', loss,batch_size=1,prog_bar=True)
+        self.log('loss_RNA', loss_RNA,batch_size=1,prog_bar=True)
+        self.log('loss_ST', loss_ST,batch_size=1,prog_bar=True)
+        return loss
+    
+    def predict_step(self, batch, batch_idx):
+        x, edge_index,bias = batch.x, batch.edge_index,batch.bias
+        x_hat = self(x, edge_index)
+        x_hat = x_hat.cpu().numpy()
+        return x_hat,bias
+    
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.5)
+        return [optimizer], [lr_scheduler]
