@@ -5,13 +5,13 @@ from .data import MyDataModule
 from lightning import Trainer
 from lightning.pytorch.callbacks import EarlyStopping,ModelSummary
 from typing import Literal
-
+import pandas as pd
 from .utils import make_alignments,find_mutual_nn
 import torch
 import numpy as np
 import scipy.sparse as sp
 import time
-from .utils import nn_approx,nn
+from .utils import nn_approx,nn,compute_anchor_score
 
 from anndata import AnnData
 warnings.filterwarnings('ignore', '.*deprecated.*')
@@ -315,3 +315,21 @@ def mnn_tnn_spatial(ds1, ds2, spatial1,spatial2, names1, names2, knn = 20,lr=1e-
             if alignments_matrix[i,j]>0:
                 mutual.add((names1[i],names2[j]))
     return mutual
+
+def mod_anchors(anchors_ori="temp/anchors.csv",adata1='temp/adata1.h5ad',adata2='temp/adata2.h5ad',min_value=0.8,lamb=0.3,devices=[2],lr=1e-3,replace=True,default_root_dir='./Logs/SeuratMod'):
+    """
+    change anchors matrix for Seurat-based anchors
+    
+    """
+    anchors_ori = pd.read_csv(anchors_ori)
+    mnn1 = (anchors_ori['cell1']-1).to_list()
+    mnn2 = (anchors_ori['cell2']-1).to_list()
+    if isinstance(adata1,str):
+        adata1 = sc.read_h5ad(adata1)
+    if isinstance(adata2,str):
+        adata2 = sc.read_h5ad(adata2)
+    alignments_matrix = get_alignments(adata1=adata1,adata2=adata2,mnns=[mnn1,mnn2],min_value=min_value,lamb=lamb,devices=devices,lr=lr,replace=replace,default_root_dir=default_root_dir)
+    mutual_1 , mutual_2 = alignments_matrix.nonzero()
+    score = compute_anchor_score(adata1,adata2,mutual_1,mutual_2)
+    anchors_mod = pd.DataFrame({'cell1':(mutual_1+1).tolist(),'cell2':(mutual_2+1).tolist(),'score':score})
+    return anchors_mod

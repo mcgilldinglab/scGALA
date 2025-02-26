@@ -14,6 +14,7 @@ from tqdm import tqdm
 from anndata import AnnData
 from functools import wraps
 from time import time
+from scipy import sparse
 
 
 def timing(f):
@@ -451,3 +452,108 @@ def nn(ds1, ds2, names1, names2, knn=50, metric_p=2, return_distance=False,metri
                     match[(names1[a], names2[b_i])] = nn_distances[a, b_ind]  # not sure this is fast
                     # match.add((names1[a], names2[b_i]))
             return match
+        
+# Split the data unevenly, making each cell type highly unbalanced while keeping overall train/test ratio
+def split_data_unevenly(adata, train_ratio=0.7, group_key='cell_type'):
+    train_indices = []
+    test_indices = []
+    
+    # Calculate target number of cells for train set
+    target_train_cells = int(adata.n_obs * train_ratio)
+    
+    groups = adata.obs[group_key].unique()
+    
+    # Assign extreme split ratios to each group
+    group_split_ratios = np.random.uniform(0.1, 0.9, size=len(groups))
+    
+    for group, split_ratio in zip(groups, group_split_ratios):
+        group_indices = np.where(adata.obs[group_key] == group)[0]
+        np.random.shuffle(group_indices)
+        
+        split_point = int(len(group_indices) * split_ratio)
+        
+        train_indices.extend(group_indices[:split_point])
+        test_indices.extend(group_indices[split_point:])
+    
+    # Adjust to meet overall train ratio
+    current_train_ratio = len(train_indices) / (len(train_indices) + len(test_indices))
+    
+    if current_train_ratio > train_ratio:
+        move_to_test = np.random.choice(train_indices, size=int(len(train_indices) - target_train_cells), replace=False)
+        train_indices = list(set(train_indices) - set(move_to_test))
+        test_indices.extend(move_to_test)
+    elif current_train_ratio < train_ratio:
+        move_to_train = np.random.choice(test_indices, size=int(target_train_cells - len(train_indices)), replace=False)
+        test_indices = list(set(test_indices) - set(move_to_train))
+        train_indices.extend(move_to_train)
+    
+    train_adata = adata[train_indices].copy()
+    test_adata = adata[test_indices].copy()
+    
+    return train_adata, test_adata
+
+# Simulate batch effect
+def simulate_batch_effect(data, batch_effect_strength=0.5,noise_strength=0.1):
+    if sparse.issparse(data):
+        # Convert to dense for batch effect simulation
+        data = data.toarray()
+    
+    # Simulate batch-specific gene expression changes
+    n_genes = data.shape[1]
+    batch_effect = np.random.normal(1, batch_effect_strength, size=n_genes)
+    
+    # Apply batch effect
+    data_with_batch_effect = data * batch_effect
+    
+    # Add some random noise
+    noise = np.random.normal(0, noise_strength, size=data.shape)
+    data_with_batch_effect += noise
+    
+    # Ensure non-negative values
+    data_with_batch_effect = np.clip(data_with_batch_effect, 0, None)
+    
+    # Convert back to sparse if original was sparse
+    if sparse.issparse(data):
+        data_with_batch_effect = sparse.csr_matrix(data_with_batch_effect)
+    
+    return data_with_batch_effect
+
+def compute_anchor_score(adata1, adata2, mnn1,mnn2):
+    """
+    Calculate integration scores for anchor cells between two AnnData objects
+    
+    Parameters:
+    adata1 (AnnData): First AnnData object
+    adata2 (AnnData): Second AnnData object 
+    mnn1 (np.array): MNN correspondences for first AnnData object
+    mnn2 (np.array): MNN correspondences for second AnnData object
+    
+    Returns:
+    anchor_scores (np.array): Integration scores for anchor cells between the two AnnData objects
+    """
+    # Get anchor cells
+    data1 = adata1.X
+    data2 = adata2.X
+    bias = adata1.shape[0]
+    
+    # Calculate each anchor cell's shared neighbors
+    dist11 = cdist(data1, data1)
+    idx11 = np.argsort(dist11, axis=1)[:, :31]
+    dist22 = cdist(data2, data2)
+    idx22 = np.argsort(dist22, axis=1)[:, :31]
+    dist12 = cdist(data1, data2)
+    idx12 = np.argsort(dist12, axis=1)[:, :31]
+    idx21 = np.argsort(dist12, axis=0)[:31, :].transpose()
+    
+    # Calculate shared neighbors
+    anchor_scores = np.zeros(len(mnn1))
+    for i in range(len(mnn1)):
+        all_neighbors1 = np.concatenate([idx11[mnn1[i]], idx12[mnn1[i]]+bias])
+        all_neighbors2 = np.concatenate([idx21[mnn2[i]], idx22[mnn2[i]]+bias])
+        anchor_scores[i] = len(set(all_neighbors1) & set(all_neighbors2))
+    
+    # Calculate integration scores
+    anchor_scores = (anchor_scores - np.quantile(anchor_scores, 0.01)) / (np.quantile(anchor_scores, 0.90) - np.quantile(anchor_scores, 0.01))
+    anchor_scores[anchor_scores < 0] = 0
+    anchor_scores[anchor_scores > 1] = 1
+    return anchor_scores
