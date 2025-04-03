@@ -2,12 +2,31 @@
 from typing import Any, Literal
 import torch
 import torch.nn as nn
-from torch.nn.functional import leaky_relu
-from torch_geometric.nn import GCNConv
-import GCL.augmentors as A
-from torch_geometric.nn import VGAE
-from torch_geometric.utils import negative_sampling
+import torch.nn.functional as F
 import lightning as L
+import pytorch_lightning as pl
+from torch_geometric.nn import (
+    GCNConv,
+    GATConv,
+    GATv2Conv,
+    ClusterGCNConv,
+    AGNNConv,
+    VGAE,
+    InnerProductDecoder,
+    Sequential
+)
+from torch_geometric.utils import (
+    negative_sampling,
+    remove_self_loops,
+    add_self_loops
+)
+from torch.nn import Linear, ReLU, BatchNorm1d, Dropout
+from torch import Tensor
+import GCL.augmentors as A
+
+# Constants
+EPS = 1e-15
+MAX_LOGSTD = 10
 
 class VariationalGCNEncoder(torch.nn.Module):
     def __init__(self, in_channels=-1, out_channels=256, dropout = 0.3):
@@ -19,7 +38,7 @@ class VariationalGCNEncoder(torch.nn.Module):
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
-        x = leaky_relu(self.dropout(x))
+        x = F.leaky_relu(self.dropout(x))
         return self.conv_mu(x, edge_index), self.conv_logstd(x, edge_index)
 
 aug = A.RandomChoice([
@@ -83,22 +102,6 @@ class VGAE_gcl(L.LightningModule):
         x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
         z = self.model.encode(x,edge_index)
         return z
-    
-from torch.nn import Linear, ReLU, BatchNorm1d, Dropout
-from torch_geometric.nn import InnerProductDecoder
-from torch_geometric.utils import (negative_sampling, remove_self_loops, add_self_loops)
-from torch import Tensor
-
-EPS = 1e-15
-MAX_LOGSTD = 10
-
-
-# based on torch.nn.module class in torch
-
-
-
-from torch_geometric.nn import GATConv
-import torch.nn.functional as F
 
 class GAT_Encoder(nn.Module):
     def __init__(self, num_heads, in_channels, latent_dim,hidden_dims=[64,128], dropout=0.4):
@@ -227,8 +230,8 @@ class MSVGAE_gcl(L.LightningModule):
         
         vae_loss = self.model.recon_loss(z, edge_index) 
         reconstructed_features = self.model.liner_decoder(z)
-        decoder_loss = torch.nn.functional.mse_loss(reconstructed_features, x)
-        vae_loss = 0.5*vae_loss + 0.1*(1 / num_nodes) * self.model.kl_loss() + 0.5*decoder_loss # new line
+        decoder_loss = torch.nn.functional.mse_loss(reconstructed_features, x) * 10
+        vae_loss = vae_loss + (1 / num_nodes) * self.model.kl_loss() + decoder_loss # new line
         self.log_dict({'train_loss':float(vae_loss),'decoder_loss':float(decoder_loss)},prog_bar=True)
         return vae_loss
     def configure_optimizers(self):
@@ -527,10 +530,6 @@ class MSVGAE(torch.nn.Module):
         return roc_auc_score(y, pred), average_precision_score(y, pred)
 
 # For Multiomics Generation
-import torch
-import torch.nn.functional as F
-from torch_geometric.nn import GATConv
-import pytorch_lightning as pl
 
 class GATMapper(pl.LightningModule):
     def __init__(self, in_channels, hidden_channels, out_channels, heads=4, dropout=0.2):
@@ -576,7 +575,7 @@ class GATMapper(pl.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=0.001)
 
 # For Spatial Imputation
-from torch_geometric.nn import GCNConv,GATv2Conv,Linear,ClusterGCNConv,GATConv,AGNNConv,Sequential
+
 class GNNImputer(L.LightningModule):
     def __init__(self, num_features,n_matching_genes, hidden_channels,heads=4,dropout=0.6,num_layers=3,learning_rate=1e-3,layer_type='GAT'):
         super(GNNImputer, self).__init__()

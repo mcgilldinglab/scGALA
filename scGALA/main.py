@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore', '.*deprecated.*')
 torch.set_float32_matmul_precision('medium')
 EPS = 1e-15
 
-def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20,min_ppf=0.95,min_percentile=0, min_value=0.,percent=80, default_root_dir=None,max_epochs:int = 30,lamb = 0.2,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',get_edge_probs:bool = False, get_matrix:bool = True,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False):
+def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20, min_value=0.9, default_root_dir=None,max_epochs:int = 30,lamb = 0.3,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',get_latent:bool = False, get_edge_probs:bool = False, get_matrix:bool = True,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False):
     '''
     To get the alignments as a matrix showing the possibility of their alignment and the unaligned pairs are set to zero.
     Provide either the dir of adata with data_dirs or directly provide adatas.
@@ -166,6 +166,9 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
     torch.cuda.empty_cache()
     model = None
     mydatamodule = None
+    
+    if get_latent:
+        return latent
     # show edge_prob
     if get_edge_probs:
         likelyhood = torch.matmul(latent[:bias], latent[bias:].T).sigmoid()
@@ -173,7 +176,7 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         return likelyhood
     # make alignment through score-based greedy algorithm
     if get_matrix:
-        alignments_matrix = make_alignments(latent=latent,mnn1=mnn1,mnn2=mnn2,bias=bias,lamb=lamb,min_ppf=min_ppf,min_percentile=min_percentile,min_value=min_value,percent=percent,replace=replace)
+        alignments_matrix = make_alignments(latent=latent,mnn1=mnn1,mnn2=mnn2,bias=bias,lamb=lamb,min_value=min_value,replace=replace)
         print(f'R:{data1.shape[0]} D:{data2.shape[0]}')
         return alignments_matrix
 
@@ -316,7 +319,7 @@ def mnn_tnn_spatial(ds1, ds2, spatial1,spatial2, names1, names2, knn = 20,lr=1e-
                 mutual.add((names1[i],names2[j]))
     return mutual
 
-def mod_anchors(anchors_ori="temp/anchors.csv",adata1='temp/adata1.h5ad',adata2='temp/adata2.h5ad',min_value=0.8,lamb=0.3,devices=[2],lr=1e-3,replace=True,default_root_dir='./Logs/SeuratMod'):
+def mod_seurat_anchors(anchors_ori="temp/anchors.csv",adata1='temp/adata1.h5ad',adata2='temp/adata2.h5ad',min_value=0.8,lamb=0.3,devices=[2],lr=1e-3,replace=True,default_root_dir='./Logs/SeuratMod'):
     """
     change anchors matrix for Seurat-based anchors
     

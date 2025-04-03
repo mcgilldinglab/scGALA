@@ -244,7 +244,7 @@ def make_alignments_old(latent:torch.Tensor,mnn1:list,mnn2:list,bias:int,lamb:fl
         marriage_choices[i,j] = 1
     return marriage_choices
 
-def make_alignments(latent: torch.Tensor, mnn1: list, mnn2: list, bias: int, lamb: float, min_ppf=0.95, min_percentile: int = 0, min_value: float = 0, percent=80, replace=False):
+def make_alignments(latent: torch.Tensor, mnn1: list, mnn2: list, bias: int, lamb: float, min_value: float = 0, replace=False):
     '''
     Optimized version of make alignment through score-based greedy algorithm with latent space data
     '''
@@ -493,7 +493,7 @@ def split_data_unevenly(adata, train_ratio=0.7, group_key='cell_type'):
     return train_adata, test_adata
 
 # Simulate batch effect
-def simulate_batch_effect(data, batch_effect_strength=0.5,noise_strength=0.1):
+def simulate_batch_effect(data, batch_effect_strength=0.3,noise_strength=0.3):
     if sparse.issparse(data):
         # Convert to dense for batch effect simulation
         data = data.toarray()

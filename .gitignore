@@ -173,3 +173,8 @@ cython_debug/
 # Test files
 test*.py
 test*.ipynb
+
+# VS Code settings
+.vscode/
+# Pip
+setup.py
