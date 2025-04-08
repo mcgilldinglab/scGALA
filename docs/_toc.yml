@@ -1,0 +1,21 @@
+# Table of contents
+# Learn more at https://jupyterbook.org/customize/toc.html
+
+format: jb-book
+root: intro
+parts:
+- caption: Tutorials 🪄
+  chapters:
+  - file: tutorial
+    sections:
+    - file: tutorials/Batch_Correction_Comparison_INSCT_Supervised
+    - file: tutorials/Label_Transfer_Comparison_Seurat
+    - file: tutorials/Multiomics_Integration_Seurat
+    - file: tutorials/Spatial_Alignment_STAligner
+    - file: tutorials/Multiplet-omics_Integration
+    - file: tutorials/Cross-modality_Imputation
+    - file: tutorials/Spatial_Transcriptomics_Imputation
+- caption: APIs 🕶️
+  chapters:
+  - file: APIs
+

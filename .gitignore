@@ -178,3 +178,6 @@ test*.ipynb
 .vscode/
 # Pip
 setup.py
+
+/docs/conf.py
+/docs/_build
