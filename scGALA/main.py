@@ -1,9 +1,12 @@
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import warnings
 import scanpy as sc
-from .model import MSVGAE_gcl,MSVGAE_gcl_spatialGW
-from .data import MyDataModule
+import gc
+from .model import MSVGAE_gcl,MSVGAE_gcl_spatialGW,TwoStageGNNImputer
+from .data import MyDataModule,TwoStageDataModule
 from lightning import Trainer
-from lightning.pytorch.callbacks import EarlyStopping,ModelSummary
+from lightning.pytorch.callbacks import EarlyStopping,ModelSummary,ModelCheckpoint
 from typing import Literal
 import pandas as pd
 from .utils import make_alignments,find_mutual_nn
@@ -88,8 +91,8 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         data1 = sc.read(data1_dir)
         data2 = sc.read(data2_dir)
     elif (not adata1 is None) and (not adata2 is None):
-        data1 = adata1
-        data2 = adata2
+        data1 = adata1.copy()
+        data2 = adata2.copy()
     else:
         print('Data input is not sufficient. Please provide the dir of adata or directly provide adata')
     bias = data1.shape[0]
@@ -162,10 +165,33 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         
     latent = trainer.predict(model=model,datamodule=mydatamodule)[0]
     
-    # clean up
-    torch.cuda.empty_cache()
-    model = None
-    mydatamodule = None
+    # Explicit cleanup - ensure memory is released
+    if 'model' in locals():
+        # Move model to CPU first
+        if hasattr(model, 'cuda') and next(model.parameters()).is_cuda:
+            model = model.cpu()
+        # Delete model
+        del model
+    
+    if 'mydatamodule' in locals():
+        # Clean up data module
+        if hasattr(mydatamodule, 'train_dataset') and mydatamodule.train_dataset is not None:
+            del mydatamodule.train_dataset
+        if hasattr(mydatamodule, 'val_dataset') and mydatamodule.val_dataset is not None:
+            del mydatamodule.val_dataset
+        del mydatamodule
+    
+    if 'trainer' in locals():
+        # Clean up trainer
+        del trainer
+    
+    # Force garbage collection
+    gc.collect()
+    
+    # Clear CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
     
     if get_latent:
         return latent
@@ -173,6 +199,7 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
     if get_edge_probs:
         likelyhood = torch.matmul(latent[:bias], latent[bias:].T).sigmoid()
         likelyhood = np.array(likelyhood.detach().cpu()) # [data1.shape[0],data2.shape[0]]
+        likelyhood[likelyhood < min_value] = 0
         return likelyhood
     # make alignment through score-based greedy algorithm
     if get_matrix:
@@ -336,3 +363,134 @@ def mod_seurat_anchors(anchors_ori="temp/anchors.csv",adata1='temp/adata1.h5ad',
     score = compute_anchor_score(adata1,adata2,mutual_1,mutual_2)
     anchors_mod = pd.DataFrame({'cell1':(mutual_1+1).tolist(),'cell2':(mutual_2+1).tolist(),'score':score})
     return anchors_mod
+
+def two_stage_spatial_imputation(adata_sn, adata_st, mnn1=None, mnn2=None, 
+                                hidden_channels=128, num_layers=3, layer_type='ClusterGCN',
+                                stage1_epochs=1000, similarity_weight=0.5,dropout=0., 
+                                max_epochs=-1, lr=1e-3, alignment_lr=1e-3,
+                                devices=[0], alignment_devices=None, k=20,default_root_dir='./logs/two_stage_spatial_imputation',
+                                stage1_checkpoint=None,alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=1e-4):
+    """
+    Two-stage spatial transcriptomics imputation with similarity preservation
+    
+    Parameters
+    ----------
+    adata_sn : AnnData
+        Single-nuclei RNA-seq data (reference)
+    adata_st : AnnData  
+        Spatial transcriptomics data (to be imputed)
+    mnn1, mnn2 : list, optional
+        Pre-computed mutual nearest neighbors
+    hidden_channels : int, default 512
+        Hidden layer size
+    num_layers : int, default 3
+        Number of GNN layers
+    layer_type : str, default 'GAT'
+        Type of GNN layer
+    stage1_epochs : int, default 50
+        Number of epochs for stage 1 (imputation only)
+    similarity_weight : float, default 0.5
+        Weight for similarity preservation loss in stage 2
+    max_epochs : int, default 100
+        Maximum training epochs
+    lr : float, default 1e-3
+        Learning rate for main model
+    alignment_lr : float, default 1e-4
+        Learning rate for alignment computation
+    devices : list, default [0]
+        GPU devices to use for main model training
+    alignment_devices : list, optional
+        GPU devices to use for alignment computation. If None, uses same as devices
+    k : int, default 20
+        Number of neighbors for graph construction
+    stage1_checkpoint : str, optional
+        Path to saved stage 1 checkpoint file. If provided, will load this 
+        checkpoint and skip stage 1 training, going directly to stage 2
+    
+    Returns
+    -------
+    trainer : pytorch_lightning.Trainer
+        Trained model
+    model : TwoStageGNNImputer
+        Trained imputation model
+    data_module : TwoStageDataModule
+        Data module with processed data
+    """
+    
+    # Set alignment devices to main devices if not specified
+    if alignment_devices is None:
+        alignment_devices = devices
+    
+    # Prepare data
+    data_module = TwoStageDataModule(
+        adata_sn=adata_sn,
+        adata_st=adata_st, 
+        k=k,
+        mnn1=mnn1,
+        mnn2=mnn2
+    )
+    
+    # Initialize model
+    if stage1_checkpoint is not None:
+        # Load pre-trained stage 1 model
+        print(f"Loading stage 1 checkpoint from: {stage1_checkpoint}")
+        model = TwoStageGNNImputer.load_from_checkpoint(
+            stage1_checkpoint,
+            num_features=data_module.x.shape[1],
+            n_matching_genes=data_module.n_matching_genes,
+            hidden_channels=hidden_channels,
+            num_layers=num_layers,
+            layer_type=layer_type,
+            lr=lr,
+            dropout=dropout,
+            stage1_epochs=0,  # Skip stage 1 since we're loading a checkpoint
+            similarity_weight=similarity_weight,
+            alignment_lr=alignment_lr,
+            alignment_devices=alignment_devices,
+            alignment_update_freq_delta=alignment_update_freq_delta,
+            stage2_patience=stage2_patience, 
+            stage2_min_delta=stage2_min_delta
+        )
+        # Mark stage 1 as complete
+        model.stage1_complete = True
+        model.current_epoch_stage = stage1_epochs
+        print("Stage 1 checkpoint loaded. Will proceed directly to stage 2.")
+    else:
+        model = TwoStageGNNImputer(
+            num_features=data_module.x.shape[1],
+            n_matching_genes=data_module.n_matching_genes,
+            hidden_channels=hidden_channels,
+            num_layers=num_layers,
+            layer_type=layer_type,
+            lr=lr,
+            dropout=dropout,
+            stage1_epochs=stage1_epochs,
+            similarity_weight=similarity_weight,
+            alignment_lr=alignment_lr,
+            alignment_devices=alignment_devices,
+            alignment_update_freq_delta=alignment_update_freq_delta,
+            stage2_patience=stage2_patience, 
+            stage2_min_delta=stage2_min_delta
+        )
+    
+    # Setup trainer
+    trainer = Trainer(
+        max_epochs=max_epochs,
+        devices=devices,
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        log_every_n_steps=1,
+        enable_checkpointing=True,
+        default_root_dir=default_root_dir,
+        callbacks=[
+            ModelCheckpoint(
+                monitor='stage1_loss' if stage1_checkpoint is None else 'stage2_loss',
+                save_top_k=1,
+                mode='min'
+            )
+        ]
+    )
+    
+    # Train model
+    trainer.fit(model, data_module)
+    
+    return trainer, model, data_module

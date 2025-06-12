@@ -12,6 +12,7 @@ from torch_geometric.nn import (
     ClusterGCNConv,
     AGNNConv,
     VGAE,
+    EGConv,
     InnerProductDecoder,
     Sequential
 )
@@ -23,6 +24,9 @@ from torch_geometric.utils import (
 from torch.nn import Linear, ReLU, BatchNorm1d, Dropout
 from torch import Tensor
 import GCL.augmentors as A
+import anndata as ad
+import numpy as np
+import gc
 
 # Constants
 EPS = 1e-15
@@ -594,6 +598,9 @@ class GNNImputer(L.LightningModule):
         elif layer_type == 'AGNN':
             conv_layer = AGNNConv
             GAT = False
+        elif layer_type == 'EGConv':
+            conv_layer = EGConv
+            GAT = False
         else:
             raise ValueError(f"Invalid layer type: {layer_type}")
         
@@ -605,6 +612,18 @@ class GNNImputer(L.LightningModule):
                 self.convs_list.append((conv_layer(hidden_channels*heads, hidden_channels, heads=heads, dropout=dropout),'x, edge_index -> x'))
                 self.convs_list.append((torch.nn.ReLU(),'x -> x'))
             self.convs_list.append((conv_layer(hidden_channels*heads, num_features),'x, edge_index -> x'))
+            self.convs_list.append((torch.nn.ReLU(),'x -> x'))
+        elif layer_type == 'EGConv':
+            assert hidden_channels % heads == 0, "hidden_channels must be divisible by heads for EGConv"
+            self.convs_list.append((torch.nn.Dropout(dropout),'x -> x'))
+            self.convs_list.append((conv_layer(num_features, hidden_channels,num_heads=heads,num_bases=heads,cached=True),'x, edge_index -> x'))
+            self.convs_list.append((torch.nn.ReLU(),'x -> x'))
+            for _ in range(num_layers - 2):
+                self.convs_list.append((torch.nn.Dropout(dropout),'x -> x'))
+                self.convs_list.append((conv_layer(hidden_channels, hidden_channels,num_heads=heads,num_bases=heads,cached=True),'x, edge_index -> x'))
+                self.convs_list.append((torch.nn.ReLU(),'x -> x'))
+            self.convs_list.append((torch.nn.Dropout(dropout),'x -> x'))
+            self.convs_list.append((conv_layer(hidden_channels, num_features,num_heads=heads,num_bases=heads,cached=True),'x, edge_index -> x'))
             self.convs_list.append((torch.nn.ReLU(),'x -> x'))
         else:
             self.convs_list.append((torch.nn.Dropout(dropout),'x -> x'))
@@ -645,3 +664,280 @@ class GNNImputer(L.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.5)
         return [optimizer], [lr_scheduler]
+
+# For Improved Spatial Imputation with scGALA
+class TwoStageGNNImputer(L.LightningModule):
+    def __init__(self, num_features, n_matching_genes, hidden_channels=512, num_layers=3, 
+                 layer_type='ClusterGCN', dropout=0.3, lr=1e-3, stage1_epochs=500, 
+                 similarity_weight=0.5, alignment_lr=1e-4, alignment_devices=None,
+                 alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=1e-4):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        # Main imputation model
+        self.imputer = GNNImputer(num_features=num_features, n_matching_genes=n_matching_genes, hidden_channels=hidden_channels, 
+                                  num_layers=num_layers, layer_type=layer_type, dropout=dropout, learning_rate=lr)
+        
+        # Two-stage training parameters
+        self.stage1_epochs = stage1_epochs
+        self.similarity_weight = similarity_weight
+        self.alignment_lr = alignment_lr
+        self.alignment_devices = alignment_devices if alignment_devices is not None else [0]
+        self.current_epoch_stage = 0
+
+        # Early stopping parameters for stage 2
+        self.stage2_patience = stage2_patience
+        self.stage2_min_delta = stage2_min_delta
+        self.stage2_best_loss = float('inf')
+        self.stage2_wait = 0
+        self.stage2_stopped = False
+        
+        # For storing intermediate results
+        self.stage1_complete = False
+        self.sn_indices = None
+        self.st_indices = None
+        self.alignment_update_freq = 1
+        self.alignment_update_freq_delta = alignment_update_freq_delta
+        self.sn_sn_similarity = None
+        
+    def setup_indices(self, sn_size, st_size):
+        """Setup indices for SN and ST data"""
+        sn_size = int(sn_size)
+        st_size = int(st_size)
+        if sn_size <= 0 or st_size <= 0:
+            raise ValueError("sn_size and st_size must be positive integers.")
+        self.sn_indices = torch.arange(sn_size)
+        self.st_indices = torch.arange(sn_size, sn_size + st_size)
+        
+    def forward(self, x, edge_index):
+        return self.imputer(x, edge_index)
+    
+    def compute_alignment_matrices(self, sn_data, st_data):
+        """Compute alignment matrices using scGALA's get_alignments function"""
+        from .main import get_alignments
+        
+        # Create temporary AnnData objects
+        sn_adata = ad.AnnData(X=sn_data.detach().cpu().numpy())
+        st_adata = ad.AnnData(X=st_data.detach().cpu().numpy())
+        
+        # Get alignment matrix using scGALA
+        alignment_matrix = get_alignments(
+            adata1=sn_adata, 
+            adata2=st_adata,
+            k=20,
+            min_value=0.8, 
+            lr=self.alignment_lr,
+            max_epochs=10,  # Fewer epochs for efficiency
+            get_edge_probs=True,
+            scale=True,
+            devices=self.alignment_devices,
+            default_root_dir='./logs/scgala_alignment',
+        )
+
+        # Add explicit GPU memory cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Clean up temporary AnnData objects
+        del sn_adata, st_adata
+        gc.collect()
+        
+        print('Alignment matrix computed at epoch:', self.current_epoch_stage)
+        return torch.tensor(alignment_matrix, device=self.device, dtype=torch.float32)
+    
+    def compute_similarity_matrices(self, data, k=10, sparse=True):
+        """Compute sparse pairwise similarity matrices using cosine similarity with K-NN, preserving gradients."""
+        # Normalize data
+        data_norm = F.normalize(data, p=2, dim=1)
+        
+        # Compute full cosine similarity for finding K-NN
+        full_similarity = torch.mm(data_norm, data_norm.t())
+        
+        if sparse:
+            # Find top-k similarities for each node (including self)
+            topk_values, topk_indices = torch.topk(full_similarity, k=k+1, dim=1, largest=True)
+
+            # Create a mask for the K-NN values
+            n_nodes = data.size(0)
+            mask = torch.zeros_like(full_similarity, dtype=torch.bool)
+            mask.scatter_(1, topk_indices, True)
+
+            # Use the mask to keep only K-NN similarities, set others to zero (preserves gradient)
+            similarity = torch.where(mask, full_similarity, torch.zeros_like(full_similarity))
+        else:
+            # Use full similarity matrix directly
+            similarity = full_similarity
+        # Make symmetric by taking max(sim[i,j], sim[j,i])
+        similarity = torch.max(similarity, similarity.t())
+        
+        return similarity
+    
+    def compute_similarity_loss(self, sn_data, st_data):
+        """Compute similarity preservation loss"""
+        # Get alignment probabilities between SN and ST
+        if (self.current_epoch - self.stage1_epochs) % self.alignment_update_freq == 0:
+            # Clear previous alignment matrix to free memory
+            if hasattr(self, 'sn_st_alignment'):
+                del self.sn_st_alignment
+                torch.cuda.empty_cache()
+            self.sn_st_alignment = self.compute_alignment_matrices(sn_data, st_data)
+            self.alignment_update_freq += self.alignment_update_freq_delta
+            self.alignment_update_freq_delta += self.alignment_update_freq_delta
+            # This can make similarity loss suddenly large if alignment changes significantly, so need to reset early stopping
+            self.stage2_best_loss = float('inf')
+        
+        # Compute similarity matrices
+        if self.sn_sn_similarity is None:
+            self.sn_sn_similarity = self.compute_similarity_matrices(sn_data,sparse=True,k=20)
+        st_st_similarity = self.compute_similarity_matrices(st_data, sparse=False)
+        
+        # Expected ST-ST similarity based on SN-SN similarity and SN-ST alignment
+        # expected_st_st = ST-SN @ SN-SN @ SN-ST
+        st_sn_alignment = self.sn_st_alignment.t()  # Transpose to get ST-SN
+        # Row-normalize alignment matrices (each row sums to 1)
+        st_sn_alignment_norm = F.normalize(st_sn_alignment, p=1, dim=1)
+        sn_st_alignment_norm = F.normalize(self.sn_st_alignment, p=1, dim=1)
+        expected_st_st_similarity = torch.mm(
+            torch.mm(st_sn_alignment_norm, self.sn_sn_similarity), 
+            sn_st_alignment_norm
+        )
+        
+        # Compute cosine similarity between expected and actual ST-ST similarities
+        expected_flat = expected_st_st_similarity.flatten()
+        actual_flat = st_st_similarity.flatten()
+        
+        # Normalize vectors
+        expected_norm = F.normalize(expected_flat.unsqueeze(0), p=2, dim=1)
+        actual_norm = F.normalize(actual_flat.unsqueeze(0), p=2, dim=1)
+        
+        # Compute cosine similarity (we want to maximize this, so minimize 1 - similarity)
+        cosine_sim = F.cosine_similarity(expected_norm, actual_norm, dim=1)
+        similarity_loss = 1 - cosine_sim.mean()
+        
+        return similarity_loss, {
+            'sn_st_alignment': self.sn_st_alignment,
+            'expected_st_st_similarity': expected_st_st_similarity,
+            'actual_st_st_similarity': st_st_similarity,
+            'cosine_similarity': cosine_sim.mean()
+        }
+    
+    def training_step(self, batch, batch_idx):
+        # Early stopping check for stage 2
+        if self.stage2_stopped:
+            return None
+            
+        x, edge_index, bias = batch.x, batch.edge_index, batch.bias
+        
+        # Setup indices if not done
+        if self.sn_indices is None:
+            sn_size = bias
+            st_size = x.size(0) - bias
+            self.setup_indices(sn_size, st_size)
+        
+        # Forward pass
+        x_hat = self(x, edge_index)
+        
+        # Stage 1: Regular imputation loss
+        loss_sn = F.mse_loss(x_hat[self.sn_indices], x[self.sn_indices])
+        loss_st = F.mse_loss(x_hat[self.st_indices, :self.hparams.n_matching_genes], 
+                            x[self.st_indices, :self.hparams.n_matching_genes])
+        imputation_loss = loss_sn + loss_st
+        
+        # Determine current stage based on both epoch count and stage1_complete flag
+        is_stage1 = (self.current_epoch < self.stage1_epochs) and (not self.stage1_complete)
+        
+        if is_stage1:
+            # Stage 1: Only imputation loss
+            total_loss = imputation_loss
+            self.log('stage1_loss', total_loss, batch_size=1, prog_bar=True)
+            self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
+            self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
+        else:
+            # Stage 2: Imputation + similarity preservation loss
+            sn_data = x[self.sn_indices]
+            st_data = x_hat[self.st_indices]
+            
+            # Compute similarity loss with proper gradient flow
+            similarity_loss, similarity_info = self.compute_similarity_loss(sn_data, st_data)
+            
+            # Combined loss
+            total_loss = imputation_loss + self.similarity_weight * similarity_loss
+            
+            # Early stopping logic for stage 2
+            if total_loss < self.stage2_best_loss - self.stage2_min_delta:
+                self.stage2_best_loss = total_loss.item()
+                self.stage2_wait = 0
+            else:
+                self.stage2_wait += 1
+                
+            if self.stage2_wait >= self.stage2_patience:
+                self.stage2_stopped = True
+                print(f"Early stopping triggered for Stage 2 at epoch {self.current_epoch}")
+                # Save the final model
+                self.trainer.save_checkpoint('stage2_final_model.ckpt')
+                # Signal the trainer to stop
+                self.trainer.should_stop = True
+            
+            # Logging
+            self.log('stage2_loss', total_loss, batch_size=1, prog_bar=True)
+            self.log('imputation_loss', imputation_loss, batch_size=1, prog_bar=True)
+            self.log('similarity_loss', similarity_loss, batch_size=1, prog_bar=True)
+            self.log('cosine_similarity', similarity_info['cosine_similarity'], batch_size=1)
+            self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
+            self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
+            self.log('stage2_wait', self.stage2_wait, batch_size=1)
+            self.log('stage2_best_loss', self.stage2_best_loss, batch_size=1)
+        
+        return total_loss
+    
+    def on_train_epoch_end(self):
+        self.current_epoch_stage += 1
+        
+        # Mark stage 1 completion (only if not already complete from checkpoint loading)
+        if self.current_epoch_stage == self.stage1_epochs and not self.stage1_complete:
+            self.stage1_complete = True
+            print(f"Stage 1 completed. Switching to Stage 2 with similarity regularization.")
+            print('save the stage 1 model')
+            self.trainer.save_checkpoint('stage1_model.ckpt')
+            self.imputer.eval()
+            with torch.no_grad():
+                # Save the imputed data after stage 1
+                x_hat = self.imputer(self.trainer.datamodule.data.x.to(self.device), 
+                                     self.trainer.datamodule.data.edge_index.to(self.device))
+                # Extract imputed spatial data
+                imputed_st = x_hat[self.trainer.datamodule.data.bias:].cpu().numpy()
+                var_names = np.loadtxt('./var_names_two_stage.txt',dtype=str)[1:].tolist()
+                # Create new AnnData with imputed results
+                adata_st_imputed = ad.AnnData(imputed_st)
+                adata_st_imputed.var_names = var_names
+                # Save the imputed AnnData object
+                adata_st_imputed.write('./adata_st_imputed_first_stage.h5ad')
+                del adata_st_imputed, imputed_st, x_hat
+                print("Imputed ST data (Stage 1) saved to './adata_st_imputed_first_stage.h5ad'")
+            self.imputer.train()
+    
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=10, verbose=True
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "stage1_loss" if not self.stage1_complete else "stage2_loss",
+            },
+        }
+
+    def lr_scheduler_step(self, scheduler, optimizer_idx):
+        # Dynamically select the metric to monitor
+        monitor_metric = "stage1_loss" if not self.stage1_complete else "stage2_loss"
+        metric_value = self.trainer.callback_metrics.get(monitor_metric)
+        if metric_value is not None:
+            scheduler.step(metric_value)
+        else:
+            print(f"Warning: Metric '{monitor_metric}' not found. Skipping scheduler step.")

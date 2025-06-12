@@ -1,8 +1,10 @@
 # For Cell Alignment
 from anndata import AnnData
 from torch.utils.data import Dataset,DataLoader
+import torch_geometric.data as pyg_data
 from .utils import get_graph
 import lightning as L
+import scanpy as sc
 
 class FullBatchDataset(Dataset):
     def __init__(self,adata1:AnnData,adata2:AnnData,mnn1,mnn2,length,spatial=False):
@@ -163,13 +165,13 @@ class MyDataModule_OneStage(L.LightningDataModule):
         pass
 
     def train_dataloader(self):
-        return DataLoader([self.data],batch_size=1)
+        return pyg_data.DataLoader([self.data],batch_size=1)
 
     def val_dataloader(self):
-        return DataLoader([self.data],batch_size=1)
+        return pyg_data.DataLoader([self.data],batch_size=1)
     
     def predict_dataloader(self):
-        return DataLoader([self.data],batch_size=1)
+        return pyg_data.DataLoader([self.data],batch_size=1)
 
     def teardown(self, stage):
         # Clean up state after the trainer stops, delete files...
@@ -194,7 +196,9 @@ def get_graph_spatial(data1:AnnData,data2:AnnData,mnn1,mnn2,k=20):
     
     ## make data2 the feature size as data1, fill the rest with zeros
     data2_new = AnnData(X=np.zeros((data2.shape[0],data1.shape[1]),dtype=np.float32))
-    data2_new[:,:data2.n_vars] = data2.X
+    # print(f"data1 shape: {data1.shape}, data2 shape: {data2.shape}, data2_new shape: {data2_new.shape}")
+    data2_new.X[:,:data2.n_vars] = data2.X.toarray() if hasattr(data2.X, 'toarray') else data2.X
+    # print(f"data2_new after filling: {data2_new}")
     bias = data1.shape[0]
     # total_length = data1.shape[0] + data2.shape[0]
     MNN_row, MNN_col = mnn1_index,mnn2_index
@@ -211,7 +215,52 @@ def get_graph_spatial(data1:AnnData,data2:AnnData,mnn1,mnn2,k=20):
     edge_index = torch.from_numpy(np.array([row,col])).contiguous()
     
     edge_index = to_undirected(edge_index).to(torch.int32)
-    x = np.concatenate([data1.X, data2_new.X],axis=0) # get node features
+    # print(data1.X.shape,data2_new.X.shape)
+    data1_x = data1.X.toarray() if hasattr(data1.X, 'toarray') else data1.X
+    data2_new_x = data2_new.X.toarray() if hasattr(data2_new.X, 'toarray') else data2_new.X
+    # Concatenate the node features
+    x = np.concatenate([data1_x, data2_new_x],axis=0) # get node features
     x = torch.from_numpy(x).to(torch.float32)
     num_nodes = data1.shape[0] + data2.shape[0]
     return x, edge_index, bias, num_nodes
+
+# For Improved Spatial Imputation with scGALA: Two-Stage Data Module
+class TwoStageDataModule(L.LightningDataModule):
+    def __init__(self, adata_sn: AnnData, adata_st: AnnData, k=20, save=True, 
+                 mnn1=None, mnn2=None, batch_size=1):
+        super().__init__()
+        self.batch_size = batch_size
+        sc.pp.pca(adata_sn)
+        sc.pp.pca(adata_st)
+        # Store original data
+        self.adata_sn = adata_sn
+        self.adata_st = adata_st
+        
+        # Prepare data similar to MyDataModule_OneStage
+        start_time = time.time()
+        reordered_adata_sn, adata_st_common, n_matching_genes = reorder_adata_genes(
+            adata_sn, adata_st
+        )
+        end_time = time.time()
+        print(f"Time taken to reorder adata genes: {end_time - start_time:.4f} seconds")
+        print(f'{n_matching_genes} matching genes and {adata_sn.shape[1]-n_matching_genes} only in SN data')
+        
+        self.n_matching_genes = n_matching_genes
+        self.x, self.edge_index, self.bias, self.num_nodes = get_graph_spatial(
+            reordered_adata_sn, adata_st_common, mnn1, mnn2, k
+        )
+        
+        if save:
+            with open('var_names_two_stage.txt', 'w') as f:
+                f.write(f'{n_matching_genes}\n')
+                for var_name in reordered_adata_sn.var_names:
+                    f.write(f'{var_name}\n')
+    
+    def setup(self, stage=None):
+        self.data = pyg_data.Data(x=self.x, edge_index=self.edge_index, bias=self.bias)
+    
+    def train_dataloader(self):
+        return pyg_data.DataLoader([self.data], batch_size=self.batch_size, shuffle=False)
+    
+    def val_dataloader(self):
+        return pyg_data.DataLoader([self.data], batch_size=self.batch_size, shuffle=False)
