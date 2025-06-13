@@ -369,7 +369,8 @@ def two_stage_spatial_imputation(adata_sn, adata_st, mnn1=None, mnn2=None,
                                 stage1_epochs=1000, similarity_weight=0.5,dropout=0., 
                                 max_epochs=-1, lr=1e-3, alignment_lr=1e-3,
                                 devices=[0], alignment_devices=None, k=20,default_root_dir='./logs/two_stage_spatial_imputation',
-                                stage1_checkpoint=None,alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=1e-4):
+                                stage1_checkpoint=None,alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=5e-4,
+                                stage1_patience=10, stage1_min_delta=5e-4):
     """
     Two-stage spatial transcriptomics imputation with similarity preservation
     
@@ -406,6 +407,10 @@ def two_stage_spatial_imputation(adata_sn, adata_st, mnn1=None, mnn2=None,
     stage1_checkpoint : str, optional
         Path to saved stage 1 checkpoint file. If provided, will load this 
         checkpoint and skip stage 1 training, going directly to stage 2
+    stage1_patience : int, default 10
+        Early stopping patience for stage 1
+    stage1_min_delta : float, default 1e-4
+        Minimum change for early stopping in stage 1
     
     Returns
     -------
@@ -449,12 +454,31 @@ def two_stage_spatial_imputation(adata_sn, adata_st, mnn1=None, mnn2=None,
             alignment_devices=alignment_devices,
             alignment_update_freq_delta=alignment_update_freq_delta,
             stage2_patience=stage2_patience, 
-            stage2_min_delta=stage2_min_delta
+            stage2_min_delta=stage2_min_delta,
+            stage1_patience=stage1_patience,
+            stage1_min_delta=stage1_min_delta
         )
         # Mark stage 1 as complete
         model.stage1_complete = True
         model.current_epoch_stage = stage1_epochs
         print("Stage 1 checkpoint loaded. Will proceed directly to stage 2.")
+        
+        # Setup trainer for stage 2 only
+        trainer = Trainer(
+            max_epochs=max_epochs,
+            devices=devices,
+            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+            log_every_n_steps=1,
+            enable_checkpointing=True,
+            default_root_dir=default_root_dir,
+            callbacks=[
+                ModelCheckpoint(
+                    monitor='stage2_loss',
+                    save_top_k=1,
+                    mode='min'
+                )
+            ]
+        )
     else:
         model = TwoStageGNNImputer(
             num_features=data_module.x.shape[1],
@@ -470,25 +494,34 @@ def two_stage_spatial_imputation(adata_sn, adata_st, mnn1=None, mnn2=None,
             alignment_devices=alignment_devices,
             alignment_update_freq_delta=alignment_update_freq_delta,
             stage2_patience=stage2_patience, 
-            stage2_min_delta=stage2_min_delta
+            stage2_min_delta=stage2_min_delta,
+            stage1_patience=stage1_patience,
+            stage1_min_delta=stage1_min_delta
         )
-    
-    # Setup trainer
-    trainer = Trainer(
-        max_epochs=max_epochs,
-        devices=devices,
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        log_every_n_steps=1,
-        enable_checkpointing=True,
-        default_root_dir=default_root_dir,
-        callbacks=[
-            ModelCheckpoint(
-                monitor='stage1_loss' if stage1_checkpoint is None else 'stage2_loss',
-                save_top_k=1,
-                mode='min'
-            )
-        ]
-    )
+        
+        # Setup trainer for both stages with dynamic early stopping
+        trainer = Trainer(
+            max_epochs=max_epochs,
+            devices=devices,
+            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+            log_every_n_steps=1,
+            enable_checkpointing=True,
+            default_root_dir=default_root_dir,
+            callbacks=[
+                ModelCheckpoint(
+                    monitor='stage1_loss',
+                    save_top_k=1,
+                    mode='min',
+                    filename='stage1-{epoch:02d}-{stage1_loss:.4f}'
+                ),
+                ModelCheckpoint(
+                    monitor='stage2_loss',
+                    save_top_k=1,
+                    mode='min',
+                    filename='stage2-{epoch:02d}-{stage2_loss:.4f}'
+                )
+            ]
+        )
     
     # Train model
     trainer.fit(model, data_module)

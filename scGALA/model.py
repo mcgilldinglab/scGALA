@@ -670,7 +670,8 @@ class TwoStageGNNImputer(L.LightningModule):
     def __init__(self, num_features, n_matching_genes, hidden_channels=512, num_layers=3, 
                  layer_type='ClusterGCN', dropout=0.3, lr=1e-3, stage1_epochs=500, 
                  similarity_weight=0.5, alignment_lr=1e-4, alignment_devices=None,
-                 alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=1e-4):
+                 alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=1e-4,
+                 stage1_patience=10, stage1_min_delta=1e-4):
         super().__init__()
         self.save_hyperparameters()
         
@@ -684,6 +685,13 @@ class TwoStageGNNImputer(L.LightningModule):
         self.alignment_lr = alignment_lr
         self.alignment_devices = alignment_devices if alignment_devices is not None else [0]
         self.current_epoch_stage = 0
+
+        # Early stopping parameters for stage 1
+        self.stage1_patience = stage1_patience
+        self.stage1_min_delta = stage1_min_delta
+        self.stage1_best_loss = float('inf')
+        self.stage1_wait = 0
+        self.stage1_stopped = False
 
         # Early stopping parameters for stage 2
         self.stage2_patience = stage2_patience
@@ -848,11 +856,31 @@ class TwoStageGNNImputer(L.LightningModule):
         is_stage1 = (self.current_epoch < self.stage1_epochs) and (not self.stage1_complete)
         
         if is_stage1:
-            # Stage 1: Only imputation loss
+            # Stage 1: Only imputation loss with early stopping
             total_loss = imputation_loss
+            
+            # Early stopping logic for stage 1
+            if total_loss < self.stage1_best_loss - self.stage1_min_delta:
+                self.stage1_best_loss = total_loss.item()
+                self.stage1_wait = 0
+            else:
+                self.stage1_wait += 1
+                
+            if self.stage1_wait >= self.stage1_patience:
+                self.stage1_stopped = True
+                self.stage1_complete = True
+                print(f"Early stopping triggered for Stage 1 at epoch {self.current_epoch}")
+                print("Stage 1 completed early. Switching to Stage 2 with similarity regularization.")
+                # Save stage 1 model
+                self.trainer.save_checkpoint('stage1_early_stopped_model.ckpt')
+                # Reset the current epoch stage to trigger stage 2
+                self.current_epoch_stage = self.stage1_epochs
+            
             self.log('stage1_loss', total_loss, batch_size=1, prog_bar=True)
             self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
             self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
+            self.log('stage1_wait', self.stage1_wait, batch_size=1)
+            self.log('stage1_best_loss', self.stage1_best_loss, batch_size=1)
         else:
             # Stage 2: Imputation + similarity preservation loss
             sn_data = x[self.sn_indices]
@@ -894,29 +922,34 @@ class TwoStageGNNImputer(L.LightningModule):
     def on_train_epoch_end(self):
         self.current_epoch_stage += 1
         
-        # Mark stage 1 completion (only if not already complete from checkpoint loading)
-        if self.current_epoch_stage == self.stage1_epochs and not self.stage1_complete:
+        # Mark stage 1 completion (only if not already complete from checkpoint loading or early stopping)
+        if (self.current_epoch_stage == self.stage1_epochs and not self.stage1_complete and not self.stage1_stopped):
             self.stage1_complete = True
-            print(f"Stage 1 completed. Switching to Stage 2 with similarity regularization.")
-            print('save the stage 1 model')
+            print(f"Stage 1 completed normally at epoch {self.stage1_epochs}. Switching to Stage 2 with similarity regularization.")
+            print('Saving the stage 1 model')
             self.trainer.save_checkpoint('stage1_model.ckpt')
-            self.imputer.eval()
-            with torch.no_grad():
-                # Save the imputed data after stage 1
-                x_hat = self.imputer(self.trainer.datamodule.data.x.to(self.device), 
-                                     self.trainer.datamodule.data.edge_index.to(self.device))
-                # Extract imputed spatial data
-                imputed_st = x_hat[self.trainer.datamodule.data.bias:].cpu().numpy()
-                var_names = np.loadtxt('./var_names_two_stage.txt',dtype=str)[1:].tolist()
-                # Create new AnnData with imputed results
-                adata_st_imputed = ad.AnnData(imputed_st)
-                adata_st_imputed.var_names = var_names
-                # Save the imputed AnnData object
-                adata_st_imputed.write('./adata_st_imputed_first_stage.h5ad')
-                del adata_st_imputed, imputed_st, x_hat
-                print("Imputed ST data (Stage 1) saved to './adata_st_imputed_first_stage.h5ad'")
-            self.imputer.train()
-    
+            
+        # Save imputed data after stage 1 completion (either normal or early stopping)
+        if self.stage1_complete and hasattr(self, 'trainer') and hasattr(self.trainer, 'datamodule'):
+            if not hasattr(self, '_stage1_data_saved'):
+                self.imputer.eval()
+                with torch.no_grad():
+                    # Save the imputed data after stage 1
+                    x_hat = self.imputer(self.trainer.datamodule.data.x.to(self.device), 
+                                         self.trainer.datamodule.data.edge_index.to(self.device))
+                    # Extract imputed spatial data
+                    imputed_st = x_hat[self.trainer.datamodule.data.bias:].cpu().numpy()
+                    var_names = np.loadtxt('./var_names_two_stage.txt',dtype=str)[1:].tolist()
+                    # Create new AnnData with imputed results
+                    adata_st_imputed = ad.AnnData(imputed_st)
+                    adata_st_imputed.var_names = var_names
+                    # Save the imputed AnnData object
+                    adata_st_imputed.write('./adata_st_imputed_first_stage.h5ad')
+                    del adata_st_imputed, imputed_st, x_hat
+                    print("Imputed ST data (Stage 1) saved to './adata_st_imputed_first_stage.h5ad'")
+                    self._stage1_data_saved = True
+                self.imputer.train()
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
         
