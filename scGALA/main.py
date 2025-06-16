@@ -364,13 +364,18 @@ def mod_seurat_anchors(anchors_ori="temp/anchors.csv",adata1='temp/adata1.h5ad',
     anchors_mod = pd.DataFrame({'cell1':(mutual_1+1).tolist(),'cell2':(mutual_2+1).tolist(),'score':score})
     return anchors_mod
 
-def two_stage_spatial_imputation(adata_sn, adata_st, mnn1=None, mnn2=None, 
-                                hidden_channels=128, num_layers=3, layer_type='ClusterGCN',
-                                stage1_epochs=1000, similarity_weight=0.5,dropout=0., 
-                                max_epochs=-1, lr=1e-3, alignment_lr=1e-3,
-                                devices=[0], alignment_devices=None, k=20,default_root_dir='./logs/two_stage_spatial_imputation',
-                                stage1_checkpoint=None,alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=5e-4,
-                                stage1_patience=10, stage1_min_delta=5e-4):
+def two_stage_spatial_imputation(
+    adata_sn, adata_st, mnn1=None, mnn2=None, 
+    hidden_channels=128, num_layers=3, layer_type='ClusterGCN',
+    stage1_epochs=1000, similarity_weight=0.5,dropout=0., 
+    max_epochs=-1, lr=1e-3, alignment_lr=1e-3,
+    devices=[0], alignment_devices=None, k=20,default_root_dir='./logs/two_stage_spatial_imputation',
+    stage1_checkpoint=None,alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=5e-4,
+    stage1_patience=10, stage1_min_delta=5e-4,
+    sn_inter_edges_path=None, st_inter_edges_path=None,
+    sn_centroid=None, st_centroid=None, force_recompute=False,
+    patient_key='patient', centroid_method='pca'
+):
     """
     Two-stage spatial transcriptomics imputation with similarity preservation
     
@@ -411,6 +416,20 @@ def two_stage_spatial_imputation(adata_sn, adata_st, mnn1=None, mnn2=None,
         Early stopping patience for stage 1
     stage1_min_delta : float, default 1e-4
         Minimum change for early stopping in stage 1
+    sn_inter_edges_path : str, optional
+        Path to save/load SN inter-sample edges (constructed by scGALA)
+    st_inter_edges_path : str, optional
+        Path to save/load ST inter-sample edges (constructed by scGALA)
+    sn_centroid : str, optional
+        Patient/sample id to use as centroid for SN
+    st_centroid : str, optional
+        Patient/sample id to use as centroid for ST
+    force_recompute : bool, default False
+        Force recomputation of inter-sample edges even if file exists
+    patient_key : str, default 'patient'
+        Column name in AnnData.obs for patient/sample id
+    centroid_method : str, default 'pca'
+        Method for centroid selection ('pca' or 'umap')
     
     Returns
     -------
@@ -432,7 +451,15 @@ def two_stage_spatial_imputation(adata_sn, adata_st, mnn1=None, mnn2=None,
         adata_st=adata_st, 
         k=k,
         mnn1=mnn1,
-        mnn2=mnn2
+        mnn2=mnn2,
+        sn_inter_edges_path=sn_inter_edges_path,
+        st_inter_edges_path=st_inter_edges_path,
+        sn_centroid=sn_centroid,
+        st_centroid=st_centroid,
+        devices=devices,
+        force_recompute=force_recompute,
+        patient_key=patient_key,
+        centroid_method=centroid_method
     )
     
     # Initialize model

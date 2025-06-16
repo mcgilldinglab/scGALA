@@ -182,7 +182,16 @@ class MyDataModule_OneStage(L.LightningDataModule):
 def get_graph_spatial(data1:AnnData,data2:AnnData,mnn1,mnn2,k=20):
     # Get graph data
     edge_1 = kneighbors_graph(data1.obsm['X_pca'], k, mode='distance').tocoo()
-    edge_2 = kneighbors_graph(data2.obsm['X_pca'], k, mode='distance').tocoo()
+    
+    if 'spatial' not in data2.obsm:
+        print("data2 does not have spatial coordinates, using PCA instead.")
+        edge_2 = kneighbors_graph(data2.obsm['X_pca'], k, mode='distance').tocoo()
+    else:
+        edge_2_pca = kneighbors_graph(data2.obsm['spatial'], int(k/2), mode='distance')
+        edge_2_spatial = kneighbors_graph(data2.obsm['spatial'], int(k/2), mode='distance')
+        # Combine the two edges in coo format
+        edge_2 = edge_2_pca + edge_2_spatial
+        edge_2 = edge_2.tocoo()
     
     # find the index of mnn1 and mnn2 in data1 and data2 if mnn1 and mnn2 are obs_names
     if isinstance(mnn1[0],str):
@@ -225,18 +234,94 @@ def get_graph_spatial(data1:AnnData,data2:AnnData,mnn1,mnn2,k=20):
     return x, edge_index, bias, num_nodes
 
 # For Improved Spatial Imputation with scGALA: Two-Stage Data Module
+import os
+import pickle
+
+def select_centroid_patient(adata, method='pca', patient_key='patient'):
+    """
+    Select the centroid patient/sample based on UMAP or PCA coordinates.
+    Returns the patient/sample id.
+    """
+    if method == 'umap':
+        if 'X_umap' not in adata.obsm:
+            import scanpy as sc
+            sc.tl.umap(adata)
+        coords = adata.obsm['X_umap']
+    else:
+        if 'X_pca' not in adata.obsm:
+            import scanpy as sc
+            sc.pp.pca(adata)
+        coords = adata.obsm['X_pca']
+    patients = adata.obs[patient_key].unique()
+    centroids = []
+    for p in patients:
+        idx = adata.obs[patient_key] == p
+        centroids.append(coords[idx].mean(axis=0))
+    centroids = np.vstack(centroids)
+    overall_centroid = coords.mean(axis=0)
+    dists = np.linalg.norm(centroids - overall_centroid, axis=1)
+    centroid_patient = patients[np.argmin(dists)]
+    return centroid_patient
+
+def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patient=None, devices=[0], force_recompute=False, patient_key='patient', centroid_method='pca',spatial=False):
+    """
+    Construct inter-sample edges using scGALA between all patients and the centroid patient.
+    Save as a dict: {patient: edge_index (2, N_edges)}.
+    """
+    if os.path.exists(save_path) and not force_recompute:
+        with open(save_path, 'rb') as f:
+            edge_dict = pickle.load(f)
+        print(f"Loaded inter-sample edges from {save_path}")
+        return edge_dict
+
+    from .main import get_alignments
+    patients = adata.obs[patient_key].unique()
+    if centroid_patient is None:
+        centroid_patient = select_centroid_patient(adata, method=centroid_method, patient_key=patient_key)
+    edge_dict = {}
+    centroid_idx = adata.obs[patient_key] == centroid_patient
+    adata_centroid = adata[centroid_idx].copy()
+    for p in patients:
+        if p == centroid_patient:
+            continue
+        idx = adata.obs[patient_key] == p
+        adata_other = adata[idx].copy()
+        align_matrix = get_alignments(
+            adata1=adata_other, adata2=adata_centroid, k=k, min_value=0.9, lamb=0.3, devices=devices,
+            get_matrix=True, scale=True,spatial=spatial
+        )
+        src, tgt = align_matrix.nonzero()
+        src_global = np.where(idx)[0][src]
+        tgt_global = np.where(centroid_idx)[0][tgt]
+        edge_index = np.stack([src_global, tgt_global], axis=0)
+        edge_dict[p] = edge_index
+    with open(save_path, 'wb') as f:
+        pickle.dump(edge_dict, f)
+    print(f"Saved inter-sample edges to {save_path}")
+    return edge_dict
+
+def load_intersample_edges(save_path):
+    with open(save_path, 'rb') as f:
+        edge_dict = pickle.load(f)
+    return edge_dict
+
 class TwoStageDataModule(L.LightningDataModule):
     def __init__(self, adata_sn: AnnData, adata_st: AnnData, k=20, save=True, 
-                 mnn1=None, mnn2=None, batch_size=1):
+                 mnn1=None, mnn2=None, batch_size=1,
+                 sn_inter_edges_path=None, st_inter_edges_path=None,
+                 sn_centroid=None, st_centroid=None, devices=[0], force_recompute=False,
+                 patient_key='patient', centroid_method='pca'):
         super().__init__()
         self.batch_size = batch_size
         sc.pp.pca(adata_sn)
         sc.pp.pca(adata_st)
-        # Store original data
         self.adata_sn = adata_sn
         self.adata_st = adata_st
-        
-        # Prepare data similar to MyDataModule_OneStage
+        self.k = k
+        self.devices = devices
+        self.force_recompute = force_recompute
+
+        # Prepare gene order as before
         start_time = time.time()
         reordered_adata_sn, adata_st_common, n_matching_genes = reorder_adata_genes(
             adata_sn, adata_st
@@ -244,23 +329,100 @@ class TwoStageDataModule(L.LightningDataModule):
         end_time = time.time()
         print(f"Time taken to reorder adata genes: {end_time - start_time:.4f} seconds")
         print(f'{n_matching_genes} matching genes and {adata_sn.shape[1]-n_matching_genes} only in SN data')
-        
         self.n_matching_genes = n_matching_genes
-        self.x, self.edge_index, self.bias, self.num_nodes = get_graph_spatial(
-            reordered_adata_sn, adata_st_common, mnn1, mnn2, k
+
+        # --- Inter-sample edges for SN ---
+        if sn_inter_edges_path is None:
+            sn_inter_edges_path = './sn_inter_edges.pkl'
+        sn_inter_edges = construct_and_save_intersample_edges(
+            reordered_adata_sn, sn_inter_edges_path, k=k, centroid_patient=sn_centroid, devices=devices,
+            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method,spatial=False
         )
-        
+
+        # --- Inter-sample edges for ST ---
+        if st_inter_edges_path is None:
+            st_inter_edges_path = './st_inter_edges.pkl'
+        st_inter_edges = construct_and_save_intersample_edges(
+            adata_st_common, st_inter_edges_path, k=k, centroid_patient=st_centroid, devices=devices,
+            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method, spatial=True
+        )
+
+        # --- Intra-sample edges ---
+        sn_patients = reordered_adata_sn.obs[patient_key].unique()
+        sn_edges = []
+        for p in sn_patients:
+            idx = reordered_adata_sn.obs[patient_key] == p
+            X = reordered_adata_sn.obsm['X_pca'][idx]
+            local_indices = np.where(idx)[0]
+            knn = kneighbors_graph(X, k, mode='distance').tocoo()
+            sn_edges.append(np.stack([local_indices[knn.row], local_indices[knn.col]], axis=0))
+        sn_edges = np.concatenate(sn_edges, axis=1) if sn_edges else np.zeros((2,0), dtype=int)
+
+        st_patients = adata_st_common.obs[patient_key].unique()
+        st_edges = []
+        st_spatial_edges = []
+        for p in st_patients:
+            idx = adata_st_common.obs[patient_key] == p
+            X = adata_st_common.obsm['X_pca'][idx]
+            local_indices = np.where(idx)[0]
+            knn = kneighbors_graph(X, k, mode='distance').tocoo()
+            st_edges.append(np.stack([local_indices[knn.row], local_indices[knn.col]], axis=0))
+            if 'spatial' in adata_st_common.obsm:
+                spatial_X = adata_st_common.obsm['spatial'][idx]
+                spatial_knn = kneighbors_graph(spatial_X, int(k/2), mode='distance').tocoo()
+                st_spatial_edges.append(np.stack([local_indices[spatial_knn.row], local_indices[spatial_knn.col]], axis=0))
+        st_edges = np.concatenate(st_edges, axis=1) if st_edges else np.zeros((2,0), dtype=int)
+        st_spatial_edges = np.concatenate(st_spatial_edges, axis=1) if st_spatial_edges else np.zeros((2,0), dtype=int)
+
+        # --- Combine all edges ---
+        # SN intra + SN inter
+        sn_all_edges = sn_edges
+        if sn_inter_edges is not None:
+            for arr in sn_inter_edges.values():
+                sn_all_edges = np.concatenate([sn_all_edges, arr], axis=1)
+        # ST intra + ST inter + spatial
+        st_all_edges = st_edges
+        if st_inter_edges is not None:
+            for arr in st_inter_edges.values():
+                st_all_edges = np.concatenate([st_all_edges, arr], axis=1)
+        if st_spatial_edges.shape[1] > 0:
+            st_all_edges = np.concatenate([st_all_edges, st_spatial_edges], axis=1)
+
+        # --- Merge SN and ST graphs ---
+        bias = reordered_adata_sn.shape[0]
+        # SN edges: indices as is
+        # ST edges: offset by bias
+        st_all_edges_offset = st_all_edges + bias
+        # MNN edges (if provided)
+        if mnn1 is not None and mnn2 is not None:
+            mnn_edges = np.stack([np.array(mnn1), np.array(mnn2)+bias], axis=0)
+        else:
+            mnn_edges = np.zeros((2,0), dtype=int)
+        # Final edge_index
+        edge_index = np.concatenate([sn_all_edges, st_all_edges_offset, mnn_edges], axis=1)
+        edge_index = to_undirected(torch.from_numpy(edge_index)).to(torch.int32)
+
+        # Node features
+        data1_x = reordered_adata_sn.X.toarray() if hasattr(reordered_adata_sn.X, 'toarray') else reordered_adata_sn.X
+        data2_x = adata_st_common.X.toarray() if hasattr(adata_st_common.X, 'toarray') else adata_st_common.X
+        x = np.concatenate([data1_x, data2_x], axis=0)
+        x = torch.from_numpy(x).to(torch.float32)
+        self.x = x
+        self.edge_index = edge_index
+        self.bias = bias
+        self.num_nodes = x.shape[0]
+
         if save:
             with open('var_names_two_stage.txt', 'w') as f:
                 f.write(f'{n_matching_genes}\n')
                 for var_name in reordered_adata_sn.var_names:
                     f.write(f'{var_name}\n')
-    
+
     def setup(self, stage=None):
         self.data = pyg_data.Data(x=self.x, edge_index=self.edge_index, bias=self.bias)
-    
+
     def train_dataloader(self):
         return pyg_data.DataLoader([self.data], batch_size=self.batch_size, shuffle=False)
-    
+
     def val_dataloader(self):
         return pyg_data.DataLoader([self.data], batch_size=self.batch_size, shuffle=False)

@@ -91,10 +91,15 @@ def get_graph(data1:AnnData,data2:AnnData,mnn1,mnn2,spatial=False):
         edge_1 = kneighbors_graph(data1.obsm['X_pca'], 20, mode='distance').tocoo()
         edge_2 = kneighbors_graph(data2.obsm['X_pca'], 20, mode='distance').tocoo()
     else:
+        print('Constructing graph with spatial information. Spatial coordinates need to be in the same coordinate system, and multiple slices cannot be present simultaneously.')
         edge_1 = kneighbors_graph(data1.obsm['X_pca'], 20, mode='distance').tocoo()
         edge_2 = kneighbors_graph(data2.obsm['X_pca'], 20, mode='distance').tocoo()
-        spatial_edge_1 = kneighbors_graph(data1.obsm['spatial'], 5, mode='distance').tocoo()
-        spatial_edge_2 = kneighbors_graph(data2.obsm['spatial'], 5, mode='distance').tocoo()
+        if 'spatial' not in data1.obsm and 'spatial' not in data2.obsm:
+            raise ValueError("Spatial coordinates are required for spatial graph construction.")
+        if 'spatial' in data1.obsm:
+            spatial_edge_1 = kneighbors_graph(data1.obsm['spatial'], 5, mode='distance').tocoo()
+        if 'spatial' in data2.obsm:
+            spatial_edge_2 = kneighbors_graph(data2.obsm['spatial'], 5, mode='distance').tocoo()
     
     bias = data1.shape[0]
     # total_length = data1.shape[0] + data2.shape[0]
