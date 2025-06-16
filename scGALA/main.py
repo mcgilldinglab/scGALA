@@ -374,7 +374,7 @@ def two_stage_spatial_imputation(
     stage1_patience=10, stage1_min_delta=5e-4,
     sn_inter_edges_path=None, st_inter_edges_path=None,
     sn_centroid=None, st_centroid=None, force_recompute=False,
-    patient_key='patient', centroid_method='pca'
+    patient_key='patient', centroid_method='pca',use_scGALA=True
 ):
     """
     Two-stage spatial transcriptomics imputation with similarity preservation
@@ -430,6 +430,8 @@ def two_stage_spatial_imputation(
         Column name in AnnData.obs for patient/sample id
     centroid_method : str, default 'pca'
         Method for centroid selection ('pca' or 'umap')
+    use_scGALA : bool, default True
+        Whether to use scGALA for inter-sample edge computation
     
     Returns
     -------
@@ -459,7 +461,8 @@ def two_stage_spatial_imputation(
         devices=devices,
         force_recompute=force_recompute,
         patient_key=patient_key,
-        centroid_method=centroid_method
+        centroid_method=centroid_method,
+        use_scGALA=use_scGALA
     )
     
     # Initialize model

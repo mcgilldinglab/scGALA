@@ -263,7 +263,7 @@ def select_centroid_patient(adata, method='pca', patient_key='patient'):
     centroid_patient = patients[np.argmin(dists)]
     return centroid_patient
 
-def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patient=None, devices=[0], force_recompute=False, patient_key='patient', centroid_method='pca',spatial=False):
+def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patient=None, devices=[0], force_recompute=False, patient_key='patient', centroid_method='pca',spatial=False,use_scGALA=True):
     """
     Construct inter-sample edges using scGALA between all patients and the centroid patient.
     Save as a dict: {patient: edge_index (2, N_edges)}.
@@ -281,6 +281,8 @@ def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patien
     edge_dict = {}
     centroid_idx = adata.obs[patient_key] == centroid_patient
     adata_centroid = adata[centroid_idx].copy()
+    
+    only_mnn = not use_scGALA
     for p in patients:
         if p == centroid_patient:
             continue
@@ -288,7 +290,7 @@ def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patien
         adata_other = adata[idx].copy()
         align_matrix = get_alignments(
             adata1=adata_other, adata2=adata_centroid, k=k, min_value=0.9, lamb=0.3, devices=devices,
-            get_matrix=True, scale=True,spatial=spatial
+            get_matrix=True, scale=True,spatial=spatial,only_mnn=only_mnn
         )
         src, tgt = align_matrix.nonzero()
         src_global = np.where(idx)[0][src]
@@ -310,7 +312,7 @@ class TwoStageDataModule(L.LightningDataModule):
                  mnn1=None, mnn2=None, batch_size=1,
                  sn_inter_edges_path=None, st_inter_edges_path=None,
                  sn_centroid=None, st_centroid=None, devices=[0], force_recompute=False,
-                 patient_key='patient', centroid_method='pca'):
+                 patient_key='patient', centroid_method='pca',use_scGALA=True):
         super().__init__()
         self.batch_size = batch_size
         sc.pp.pca(adata_sn)
@@ -336,7 +338,7 @@ class TwoStageDataModule(L.LightningDataModule):
             sn_inter_edges_path = './sn_inter_edges.pkl'
         sn_inter_edges = construct_and_save_intersample_edges(
             reordered_adata_sn, sn_inter_edges_path, k=k, centroid_patient=sn_centroid, devices=devices,
-            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method,spatial=False
+            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method,spatial=False,use_scGALA=use_scGALA
         )
 
         # --- Inter-sample edges for ST ---
@@ -344,7 +346,7 @@ class TwoStageDataModule(L.LightningDataModule):
             st_inter_edges_path = './st_inter_edges.pkl'
         st_inter_edges = construct_and_save_intersample_edges(
             adata_st_common, st_inter_edges_path, k=k, centroid_patient=st_centroid, devices=devices,
-            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method, spatial=True
+            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method, spatial=True,use_scGALA=use_scGALA
         )
 
         # --- Intra-sample edges ---
