@@ -100,6 +100,13 @@ The main function for cell alignment between two datasets.
 - `min_value`: Minimum alignment score threshold (default: 0.9)
 - `lamb`: Hyperparameter for score-based alignment (default: 0.3)
 - `spatial`: Whether to use spatial information in alignment (default: False)
+- `replace`: bool, default=False (Include the initial anchors).
+        Whether to not include the initial anchors in the final alignments
+- `masking_ratio` : float, default=0.3
+        Ratio of masked edges during training
+- `inter_edge_mask_weight` : float, default=0.5 (uniform masking).
+        Weight for masking inter-dataset edges during model training.
+        Higher values mean more inter-dataset edges will be removed during augmentation.
 
 **Returns:** Matrix of alignment probabilities between cells in the two datasets
 

@@ -15,6 +15,7 @@ from anndata import AnnData
 from functools import wraps
 from time import time
 from scipy import sparse
+from typing import Optional, Tuple
 
 
 def timing(f):
@@ -109,28 +110,72 @@ def get_graph(data1:AnnData,data2:AnnData,mnn1,mnn2,spatial=False):
     if not spatial:
         row = np.concatenate([edge_1.row,MNN_row,edge_2.row+bias])
         col = np.concatenate([edge_1.col,MNN_col+bias,edge_2.col+bias])
+        
+        # Create edge type indicator: 0 for intra-dataset edges, 1 for inter-dataset edges
+        intra_edges_1 = np.zeros(len(edge_1.row), dtype=np.int32)
+        intra_edges_2 = np.zeros(len(edge_2.row), dtype=np.int32)
+        inter_edges = np.ones(len(MNN_row), dtype=np.int32)
+        edge_type = np.concatenate([intra_edges_1, inter_edges, intra_edges_2])
     else:
         row = np.concatenate([edge_1.row,MNN_row,edge_2.row+bias])
         col = np.concatenate([edge_1.col,MNN_col+bias,edge_2.col+bias])
+        
+        # Create edge type indicator for non-spatial edges
+        intra_edges_1 = np.zeros(len(edge_1.row), dtype=np.int32)
+        intra_edges_2 = np.zeros(len(edge_2.row), dtype=np.int32)
+        inter_edges = np.ones(len(MNN_row), dtype=np.int32)
+        edge_type = np.concatenate([intra_edges_1, inter_edges, intra_edges_2])
+        
         spatial_row = np.concatenate([spatial_edge_1.row,spatial_edge_2.row+bias])
         spatial_col = np.concatenate([spatial_edge_1.col,spatial_edge_2.col+bias])
         spatial_edge_index = torch.from_numpy(np.array([spatial_row,spatial_col])).contiguous()
+        
+        # Create edge type indicator for spatial edges (all are intra-dataset)
+        spatial_edge_type = np.zeros(len(spatial_row), dtype=np.int32)
+        spatial_edge_type = torch.from_numpy(spatial_edge_type)
+        
         C1 = cdist(data1.obsm['spatial'],data1.obsm['spatial'],'euclidean')
         C2 = cdist(data2.obsm['spatial'],data2.obsm['spatial'],'euclidean')
         C1 /= C1.max()
         C2 /= C2.max()
-
     
     edge_index = torch.from_numpy(np.array([row,col])).contiguous()
+    edge_type = torch.from_numpy(edge_type)
     
-    edge_index = to_undirected(edge_index).to(torch.int32)
+    # Convert to undirected and propagate edge types accordingly
+    edge_index_undirected = to_undirected(edge_index).to(torch.int32)
+    
+    # Propagate edge types to undirected edges (preserve inter-dataset status)
+    edge_type_dict = {}
+    for i in range(edge_index.shape[1]):
+        src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+        edge_type_dict[(src, dst)] = edge_type[i].item()
+    
+    edge_type_undirected = []
+    for i in range(edge_index_undirected.shape[1]):
+        src, dst = edge_index_undirected[0, i].item(), edge_index_undirected[1, i].item()
+        # Check both directions since we're working with undirected graph
+        if (src, dst) in edge_type_dict:
+            edge_type_undirected.append(edge_type_dict[(src, dst)])
+        elif (dst, src) in edge_type_dict:
+            edge_type_undirected.append(edge_type_dict[(dst, src)])
+        else:
+            # This shouldn't happen, but just in case
+            edge_type_undirected.append(0)
+    
+    edge_type_undirected = torch.tensor(edge_type_undirected, dtype=torch.int32)
+    
     x = np.concatenate([data1.X, data2.X],axis=0) # get node features
     x = torch.from_numpy(x).to(torch.float32)
     num_nodes = data1.shape[0] + data2.shape[0]
+    
     if not spatial:
-        return x, edge_index, bias, num_nodes
+        return x, edge_index_undirected, bias, num_nodes, edge_type_undirected
     else:
-        return x, edge_index, bias, num_nodes, C1, C2, spatial_edge_index
+        # For spatial edge index, also create edge types
+        spatial_edge_index_undirected = to_undirected(spatial_edge_index).to(torch.int32)
+        spatial_edge_type_undirected = torch.zeros(spatial_edge_index_undirected.shape[1], dtype=torch.int32)
+        return x, edge_index_undirected, bias, num_nodes, C1, C2, spatial_edge_index_undirected, edge_type_undirected, spatial_edge_type_undirected
 
 def make_alignments_old(latent:torch.Tensor,mnn1:list,mnn2:list,bias:int,lamb:float,min_ppf=0.95,min_percentile:int = 0,min_value:float =0,percent=80,replace=False):
     '''
@@ -557,3 +602,49 @@ def compute_anchor_score(adata1, adata2, mnn1,mnn2):
     anchor_scores[anchor_scores < 0] = 0
     anchor_scores[anchor_scores > 1] = 1
     return anchor_scores
+
+class TypedEdgeRemoving:
+    r"""Removes a certain percentage of edges for each edge type.
+
+    Args:
+        intra_pe (float, optional): Percentage of intra-dataset edges to be removed.
+            (default: :obj:`0.3`)
+        inter_pe (float, optional): Percentage of inter-dataset edges to be removed.
+            (default: :obj:`0.5`)
+    """
+    def __init__(self, inter_pe: float = 0.5, total_pe: float = 0.3):
+        self.inter_pe = inter_pe * total_pe
+        self.intra_pe = (1- inter_pe) * total_pe
+        
+    def __call__(self, x: torch.Tensor, edge_index: torch.Tensor, 
+                 edge_type: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = edge_index.device
+        
+        if edge_type is None:
+            # If no edge type is provided, use default uniform removal
+            num_edges = edge_index.size(1)
+            perm = torch.randperm(num_edges, device=device)
+            preserve_mask = perm > int(self.intra_pe * num_edges)
+            return x, edge_index[:, preserve_mask]
+        
+        # Process edges by type
+        mask = torch.zeros(edge_index.size(1), dtype=torch.bool, device=device)
+        
+        # Find intra-dataset edges (type 0) and inter-dataset edges (type 1)
+        intra_idx = torch.nonzero(edge_type == 0).squeeze()
+        inter_idx = torch.nonzero(edge_type == 1).squeeze()
+        
+        # Apply different removal rates to each type
+        if intra_idx.numel() > 0:
+            num_intra = intra_idx.numel()
+            perm_intra = torch.randperm(num_intra, device=device)
+            mask_intra = perm_intra > int(self.intra_pe * num_intra)
+            mask.scatter_(0, intra_idx[mask_intra], True)
+        
+        if inter_idx.numel() > 0:
+            num_inter = inter_idx.numel()
+            perm_inter = torch.randperm(num_inter, device=device)
+            mask_inter = perm_inter > int(self.inter_pe * num_inter)
+            mask.scatter_(0, inter_idx[mask_inter], True)
+        
+        return x, edge_index[:, mask], edge_type[mask]

@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore', '.*deprecated.*')
 torch.set_float32_matmul_precision('medium')
 EPS = 1e-15
 
-def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20, min_value=0.9, default_root_dir=None,max_epochs:int = 30,lamb = 0.3,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',get_latent:bool = False, get_edge_probs:bool = False, get_matrix:bool = True,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False):
+def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20, min_value=0.9, default_root_dir=None,max_epochs:int = 30,lamb = 0.3,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',get_latent:bool = False, get_edge_probs:bool = False, get_matrix:bool = True,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False, masking_ratio=0.3,inter_edge_mask_weight:float = 0.5):
     '''
     To get the alignments as a matrix showing the possibility of their alignment and the unaligned pairs are set to zero.
     Provide either the dir of adata with data_dirs or directly provide adatas.
@@ -72,12 +72,17 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         Predefined MNN pairs
     devices : list, optional
         GPU device IDs
-    replace : bool, default=False
-        Allow replacement in alignment selection
+    replace : bool, default=False (Include the initial anchors).
+        Whether to not include the initial anchors in the final alignments
     scale : bool, default=False
         Scale the input data
     spatial : bool, default=False
         Use spatial information in alignment
+    masking_ratio : float, default=0.3
+        Ratio of masked edges during training
+    inter_edge_mask_weight : float, default=0.5
+        Weight for masking inter-dataset edges during model training.
+        Higher values mean more inter-dataset edges will be removed during augmentation.
         
     Returns
     -------
@@ -136,7 +141,7 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
     print('start to train')
     if ckpt_dir is None:
         # model = VGAE_gcl(out_channels=out_channels,dropout=dropout,lr=lr,use_scheduler=use_scheduler,optimizer=optimizer)
-        model = Model(in_channels=in_channels ,dropout=dropout,lr=lr,use_scheduler=use_scheduler,optimizer=optimizer,out_dim=out_dim,version='simple')
+        model = Model(in_channels=in_channels ,dropout=dropout,lr=lr,masking_ratio=masking_ratio,use_scheduler=use_scheduler,optimizer=optimizer,out_dim=out_dim,version='simple',inter_edge_mask_weight=inter_edge_mask_weight)
         start_time = time.time()
         while True:
             try :
@@ -158,7 +163,7 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         print('Model Training Time:',run_time,'Seconds')
     else:
         # model = VGAE_gcl.load_from_checkpoint(ckpt_dir,in_channels=in_channels , out_channels=out_channels,dropout=dropout,lr=lr,use_scheduler=use_scheduler)
-        model = Model.load_from_checkpoint(ckpt_dir,in_channels=in_channels ,dropout=dropout,lr=lr,use_scheduler=use_scheduler,optimizer=optimizer,out_dim=out_dim,version='simple')
+        model = Model.load_from_checkpoint(ckpt_dir,in_channels=in_channels ,dropout=dropout,lr=lr,masking_ratio=masking_ratio,use_scheduler=use_scheduler,optimizer=optimizer,out_dim=out_dim,version='simple',inter_edge_mask_weight=inter_edge_mask_weight)
         
     latent = trainer.predict(model=model,datamodule=mydatamodule)[0]
     

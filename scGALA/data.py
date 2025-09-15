@@ -9,6 +9,7 @@ class FullBatchDataset(Dataset):
         super().__init__()
         self.data = get_graph(data1=adata1,data2=adata2,mnn1=mnn1,mnn2=mnn2,spatial=spatial)
         self.length = length
+        self.spatial = spatial
 
     def __getitem__(self, index):
         return self.data
@@ -21,6 +22,7 @@ class MyDataModule(L.LightningDataModule):
         super().__init__()
         self.train_dataset = FullBatchDataset(adata1,adata2,mnn1,mnn2,length=20,spatial=spatial)
         self.val_dataset = FullBatchDataset(adata1,adata2,mnn1,mnn2,length=1,spatial=spatial)
+        self.spatial = spatial
     def setup(self, stage):
         # make assignments here (val/train/test split)
         # called on every process in DDP
@@ -208,10 +210,37 @@ def get_graph_spatial(data1:AnnData,data2:AnnData,mnn1,mnn2,k=20):
     row = np.concatenate([edge_1.row,MNN_row,edge_2.row+bias])
     col = np.concatenate([edge_1.col,MNN_col+bias,edge_2.col+bias])
 
+    # Create edge type indicator: 0 for intra-dataset edges, 1 for inter-dataset edges
+    intra_edges_1 = np.zeros(len(edge_1.row), dtype=np.int32)
+    intra_edges_2 = np.zeros(len(edge_2.row), dtype=np.int32)
+    inter_edges = np.ones(len(MNN_row), dtype=np.int32)
+    edge_type = np.concatenate([intra_edges_1, inter_edges, intra_edges_2])
+    edge_type = torch.from_numpy(edge_type)
+
     edge_index = torch.from_numpy(np.array([row,col])).contiguous()
     
-    edge_index = to_undirected(edge_index).to(torch.int32)
+    edge_index_undirected = to_undirected(edge_index).to(torch.int32)
+    
+    # Propagate edge types to undirected edges (preserve inter-dataset status)
+    edge_type_dict = {}
+    for i in range(edge_index.shape[1]):
+        src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+        edge_type_dict[(src, dst)] = edge_type[i].item()
+    
+    edge_type_undirected = []
+    for i in range(edge_index_undirected.shape[1]):
+        src, dst = edge_index_undirected[0, i].item(), edge_index_undirected[1, i].item()
+        # Check both directions since we're working with undirected graph
+        if (src, dst) in edge_type_dict:
+            edge_type_undirected.append(edge_type_dict[(src, dst)])
+        elif (dst, src) in edge_type_dict:
+            edge_type_undirected.append(edge_type_dict[(dst, src)])
+        else:
+            edge_type_undirected.append(0)  # Default to intra-dataset
+    
+    edge_type_undirected = torch.tensor(edge_type_undirected, dtype=torch.int32)
+    
     x = np.concatenate([data1.X, data2_new.X],axis=0) # get node features
     x = torch.from_numpy(x).to(torch.float32)
     num_nodes = data1.shape[0] + data2.shape[0]
-    return x, edge_index, bias, num_nodes
+    return x, edge_index_undirected, bias, num_nodes, edge_type_undirected
