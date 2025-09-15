@@ -11,7 +11,6 @@ from torch_geometric.nn import (
     GATv2Conv,
     ClusterGCNConv,
     AGNNConv,
-    VGAE,
     InnerProductDecoder,
     Sequential
 )
@@ -22,7 +21,7 @@ from torch_geometric.utils import (
 )
 from torch.nn import Linear, ReLU, BatchNorm1d, Dropout
 from torch import Tensor
-import GCL.augmentors as A
+# import GCL.augmentors as A
 from .utils import TypedEdgeRemoving
 
 
@@ -30,79 +29,79 @@ from .utils import TypedEdgeRemoving
 EPS = 1e-15
 MAX_LOGSTD = 10
 
-class VariationalGCNEncoder(torch.nn.Module):
-    def __init__(self, in_channels=-1, out_channels=256, dropout = 0.3):
-        super(VariationalGCNEncoder, self).__init__()
-        self.conv1 = GCNConv(in_channels, 2 * out_channels, cached=True) # cached only for transductive learning
-        self.conv_mu = GCNConv(2 * out_channels, out_channels, cached=True)
-        self.conv_logstd = GCNConv(2 * out_channels, out_channels, cached=True)
-        self.dropout = nn.Dropout(dropout)
+# class VariationalGCNEncoder(torch.nn.Module):
+#     def __init__(self, in_channels=-1, out_channels=256, dropout = 0.3):
+#         super(VariationalGCNEncoder, self).__init__()
+#         self.conv1 = GCNConv(in_channels, 2 * out_channels, cached=True) # cached only for transductive learning
+#         self.conv_mu = GCNConv(2 * out_channels, out_channels, cached=True)
+#         self.conv_logstd = GCNConv(2 * out_channels, out_channels, cached=True)
+#         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index)
-        x = F.leaky_relu(self.dropout(x))
-        return self.conv_mu(x, edge_index), self.conv_logstd(x, edge_index)
+#     def forward(self, x, edge_index):
+#         x = self.conv1(x, edge_index)
+#         x = F.leaky_relu(self.dropout(x))
+#         return self.conv_mu(x, edge_index), self.conv_logstd(x, edge_index)
 
 # Replace the existing augmentor with our custom type-specific augmentor
-aug_feature_masking = A.FeatureMasking(pf=0.1)
+# aug_feature_masking = A.FeatureMasking(pf=0.1)
 aug_edge_removing = TypedEdgeRemoving( inter_pe=0.5)  # Default values
 
-class VGAE_gcl(L.LightningModule):
-    def __init__(self,in_channels:int = -1,out_channels:int = 256,dropout:float=0.3,lr:float=3e-4,use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam') -> None:
-        super().__init__()
-        # self.x, self.edge_index, self.edge_weight, self.data = get_graph(data1,data2,k)
-        self.lr = lr
-        self.model = VGAE(VariationalGCNEncoder(in_channels=in_channels,out_channels=out_channels, dropout=dropout)) 
-        self.use_scheduler = use_scheduler
-        self.optimizer = optimizer
-    def training_step(self, batch, batch_idx):
-        x, edge_index, bias, num_nodes = batch
-        x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
-        # pdb.set_trace()
-        x_new, edge_index_new,_ = aug(x, edge_index)
-        z = self.model.encode(x_new,edge_index_new)
-        vae_loss = self.model.recon_loss(z, edge_index) 
-        vae_loss = vae_loss + (1 / num_nodes) * self.model.kl_loss()  # new line
-        self.log_dict({'train_loss':float(vae_loss)},prog_bar=True)
-        return vae_loss
-    def configure_optimizers(self):
-        if self.optimizer == 'adam':
-            optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        if self.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(self.parameters(), lr=self.lr,momentum=0.9,nesterov=True)
-        if self.use_scheduler:
-            return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='min',factor=0.2,patience=2,threshold=5e-2,    threshold_mode='rel',verbose=True),
-                "monitor": 'ave_align',
-                "frequency": 1
-                # If "monitor" references validation metrics, then "frequency" should be set to a
-                # multiple of "trainer.check_val_every_n_epoch".
-            },
-            }
-        else:
-            return optimizer
-    def lr_scheduler_step(self, scheduler, metric) -> None:
-        if metric is None:
-            scheduler.step()
-        else:
-            scheduler.step(metric)
-    def validation_step(self, batch, batch_idx):
-        x, edge_index, bias, num_nodes = batch
-        x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
-        z = self.model.encode(x,edge_index)
-        neg_edge_index = negative_sampling(edge_index, z.size(0))
-        auc,ap = self.model.test(z, edge_index, neg_edge_index)
-        likelyhood = torch.cat([(z[i]*z).sum(dim=1).unsqueeze(0) for i in range(bias)],dim=0)[:bias,bias:].sigmoid()
-        self.log_dict({'auc':auc,'ap':ap,'ave_align':likelyhood[likelyhood>0.9].shape[0]/likelyhood.shape[0]},prog_bar=True)
-    # def forward(self,x,edge_index) -> Any:
-    #     return self.model.encode(x,edge_index)
-    def predict_step(self,batch, batch_idx) -> Any:
-        x, edge_index, bias, num_nodes = batch
-        x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
-        z = self.model.encode(x,edge_index)
-        return z
+# class VGAE_gcl(L.LightningModule):
+#     def __init__(self,in_channels:int = -1,out_channels:int = 256,dropout:float=0.3,lr:float=3e-4,use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam') -> None:
+#         super().__init__()
+#         # self.x, self.edge_index, self.edge_weight, self.data = get_graph(data1,data2,k)
+#         self.lr = lr
+#         self.model = VGAE(VariationalGCNEncoder(in_channels=in_channels,out_channels=out_channels, dropout=dropout)) 
+#         self.use_scheduler = use_scheduler
+#         self.optimizer = optimizer
+#     def training_step(self, batch, batch_idx):
+#         x, edge_index, bias, num_nodes = batch
+#         x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
+#         # pdb.set_trace()
+#         x_new, edge_index_new,_ = aug(x, edge_index)
+#         z = self.model.encode(x_new,edge_index_new)
+#         vae_loss = self.model.recon_loss(z, edge_index) 
+#         vae_loss = vae_loss + (1 / num_nodes) * self.model.kl_loss()  # new line
+#         self.log_dict({'train_loss':float(vae_loss)},prog_bar=True)
+#         return vae_loss
+#     def configure_optimizers(self):
+#         if self.optimizer == 'adam':
+#             optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+#         if self.optimizer == 'sgd':
+#             optimizer = torch.optim.SGD(self.parameters(), lr=self.lr,momentum=0.9,nesterov=True)
+#         if self.use_scheduler:
+#             return {
+#             "optimizer": optimizer,
+#             "lr_scheduler": {
+#                 "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='min',factor=0.2,patience=2,threshold=5e-2,    threshold_mode='rel',verbose=True),
+#                 "monitor": 'ave_align',
+#                 "frequency": 1
+#                 # If "monitor" references validation metrics, then "frequency" should be set to a
+#                 # multiple of "trainer.check_val_every_n_epoch".
+#             },
+#             }
+#         else:
+#             return optimizer
+#     def lr_scheduler_step(self, scheduler, metric) -> None:
+#         if metric is None:
+#             scheduler.step()
+#         else:
+#             scheduler.step(metric)
+#     def validation_step(self, batch, batch_idx):
+#         x, edge_index, bias, num_nodes = batch
+#         x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
+#         z = self.model.encode(x,edge_index)
+#         neg_edge_index = negative_sampling(edge_index, z.size(0))
+#         auc,ap = self.model.test(z, edge_index, neg_edge_index)
+#         likelyhood = torch.cat([(z[i]*z).sum(dim=1).unsqueeze(0) for i in range(bias)],dim=0)[:bias,bias:].sigmoid()
+#         self.log_dict({'auc':auc,'ap':ap,'ave_align':likelyhood[likelyhood>0.9].shape[0]/likelyhood.shape[0]},prog_bar=True)
+#     # def forward(self,x,edge_index) -> Any:
+#     #     return self.model.encode(x,edge_index)
+#     def predict_step(self,batch, batch_idx) -> Any:
+#         x, edge_index, bias, num_nodes = batch
+#         x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
+#         z = self.model.encode(x,edge_index)
+#         return z
 
 class GAT_Encoder(nn.Module):
     def __init__(self, num_heads, in_channels, latent_dim,hidden_dims=[64,128], dropout=0.4):
@@ -209,7 +208,7 @@ class GAT_Encoder_no_hidden(nn.Module):
         return z_mean, z_logstd
     
 class MSVGAE_gcl(L.LightningModule):
-    def __init__(self,in_channels:int = -1,out_channels:list = [16,32,64],out_dim=64,dropout:float=0.3,lr:float=3e-4, masking_ratio=0.3,use_scheduler:bool = True,optimizer:str in ['adam','sgd'] = 'adam',version = 'normal',inter_edge_mask_weight:float = 0.5) -> None:
+    def __init__(self,in_channels:int = -1,out_channels:list = [16,32,64],out_dim=64,dropout:float=0.3,lr:float=3e-4, masking_ratio=0.3,use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',version = 'normal',inter_edge_mask_weight:float = 0.5) -> None:
         super().__init__()
         # self.x, self.edge_index, self.edge_weight, self.data = get_graph(data1,data2,k)
         self.lr = lr
@@ -221,10 +220,10 @@ class MSVGAE_gcl(L.LightningModule):
             self.model = MSVGAE(nn.ModuleList([GAT_Encoder_no_hidden(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]),out_dim=out_dim)
         self.use_scheduler = use_scheduler
         self.optimizer = optimizer
-        self.aug = A.RandomChoice([
-                    A.FeatureMasking(pf=0.1),
-                    A.EdgeRemoving(pe=masking_ratio)],
-                    num_choices=1)  ##A.NodeDropping(pn=0.1),
+        # self.aug = A.RandomChoice([
+        #             A.FeatureMasking(pf=0.1),
+        #             A.EdgeRemoving(pe=masking_ratio)],
+        #             num_choices=1)  ##A.NodeDropping(pn=0.1),
         # Setup the edge augmentor with the specified weight for inter-dataset edges
         self.edge_augmentor = TypedEdgeRemoving( inter_pe=inter_edge_mask_weight, total_pe=masking_ratio)
     def training_step(self, batch, batch_idx):
@@ -240,11 +239,7 @@ class MSVGAE_gcl(L.LightningModule):
             _, edge_index_new, edge_type_new = self.edge_augmentor(x, edge_index, edge_type)
             
             z = self.model.encode(x_new, edge_index_new)
-        else:  # Original format for backward compatibility
-            x, edge_index, bias, num_nodes = batch
-            x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
-            x_new, edge_index_new, _ = self.aug(x, edge_index)
-            z = self.model.encode(x_new, edge_index_new)
+        else: raise ValueError(f"The input data format is incorrect. It should contain 5 elements including edge types. Now it has {len(batch)} elements.")
         
         vae_loss = self.model.recon_loss(z, edge_index) 
         reconstructed_features = self.model.liner_decoder(z)
@@ -338,7 +333,7 @@ class MSVGAE_gcl_spatialGW(L.LightningModule):
             
             z = self.model.encode(x_new, edge_index_new)
             
-        else: print("The input data format is incorrect. It should contain 9 elements including edge types. Now it has {} elements.".format(len(batch)))
+        else: raise ValueError(f"The input data format is incorrect. It should contain 9 elements including edge types. Now it has {len(batch)} elements.")
         
         vae_loss = self.model.recon_loss(z, edge_index) 
         spatial_triplet_loss = self.compute_triplet_loss(z, spatial_edge_index)*6
