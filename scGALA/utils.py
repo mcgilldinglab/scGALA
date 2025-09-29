@@ -414,11 +414,14 @@ def make_alignments(latent: torch.Tensor, mnn1: list, mnn2: list, bias: int, lam
     return marriage_choices
 # # for scDML
 
-import hnswlib
 # from annoy import AnnoyIndex
 from sklearn.neighbors import NearestNeighbors
 
 def nn_approx(ds1, ds2, names1, names2, knn=50, return_distance=False,metric="cosine",flag="in"):
+    try:
+        import hnswlib
+    except ImportError:
+        raise ImportError('\nplease install hnswlib:\n\t https://github.com/nmslib/hnswlib')
     dim = ds2.shape[1]
     num_elements = ds2.shape[0]
     if(metric=="euclidean"):
