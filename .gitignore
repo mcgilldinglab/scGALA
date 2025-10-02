@@ -179,5 +179,11 @@ test*.ipynb
 # Pip
 setup.py
 
+# ReadTheDocs
 /docs/conf.py
 /docs/_build
+
+# Projects
+logs/
+Logs/
+*.log

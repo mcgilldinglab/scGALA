@@ -11,6 +11,7 @@ class FullBatchDataset(Dataset):
         super().__init__()
         self.data = get_graph(data1=adata1,data2=adata2,mnn1=mnn1,mnn2=mnn2,spatial=spatial)
         self.length = length
+        self.spatial = spatial
 
     def __getitem__(self, index):
         return self.data
@@ -23,6 +24,7 @@ class MyDataModule(L.LightningDataModule):
         super().__init__()
         self.train_dataset = FullBatchDataset(adata1,adata2,mnn1,mnn2,length=20,spatial=spatial)
         self.val_dataset = FullBatchDataset(adata1,adata2,mnn1,mnn2,length=1,spatial=spatial)
+        self.spatial = spatial
     def setup(self, stage):
         # make assignments here (val/train/test split)
         # called on every process in DDP
@@ -152,14 +154,22 @@ class MyDataModule_OneStage(L.LightningDataModule):
         print(f"Time taken to reorder adata genes: {end_time - start_time:.4f} seconds")
         print(f'{n_matching_genes} matching genes and {adata.shape[1]-n_matching_genes} only in adata')
         self.n_matching_genes = n_matching_genes
-        self.x, self.edge_index, self.bias, self.num_nodes = get_graph_spatial(reordered_adata,target_adata_common,mnn1,mnn2,k)
+        self.x, self.edge_index, self.bias, self.num_nodes, self.edge_type = get_graph_spatial(
+            reordered_adata, target_adata_common, mnn1, mnn2, k
+        )
         if save:
             with open('var_names_one_stage.txt', 'w') as f:
                 f.write(f'{n_matching_genes}\n')
                 for var_name in reordered_adata.var_names:
                     f.write(f"{var_name}\n")
             print('var_names saved in var_names_one_stage.txt')
-        self.data = Data(x=self.x, edge_index=self.edge_index, bias=self.bias, num_nodes=self.num_nodes)
+        self.data = Data(
+            x=self.x,
+            edge_index=self.edge_index,
+            bias=self.bias,
+            num_nodes=self.num_nodes,
+            edge_type=self.edge_type,
+        )
     def setup(self, stage):
         # No need for train/val split in this case
         pass
@@ -221,17 +231,41 @@ def get_graph_spatial(data1:AnnData,data2:AnnData,mnn1,mnn2,k=20):
     row = np.concatenate([edge_1.row,MNN_row,edge_2.row+bias])
     col = np.concatenate([edge_1.col,MNN_col+bias,edge_2.col+bias])
 
-    edge_index = torch.from_numpy(np.array([row,col])).contiguous()
-    
-    edge_index = to_undirected(edge_index).to(torch.int32)
-    # print(data1.X.shape,data2_new.X.shape)
+    # Create edge type indicator: 0 for intra-dataset edges, 1 for inter-dataset edges
+    intra_edges_1 = np.zeros(len(edge_1.row), dtype=np.int32)
+    intra_edges_2 = np.zeros(len(edge_2.row), dtype=np.int32)
+    inter_edges = np.ones(len(MNN_row), dtype=np.int32)
+    edge_type = np.concatenate([intra_edges_1, inter_edges, intra_edges_2])
+    edge_type = torch.from_numpy(edge_type)
+
+    edge_index = torch.from_numpy(np.array([row, col])).contiguous()
+    edge_index_undirected = to_undirected(edge_index).to(torch.int32)
+
+    # Propagate edge types to undirected edges (preserve inter-dataset status)
+    edge_type_dict = {}
+    for i in range(edge_index.shape[1]):
+        src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+        edge_type_dict[(src, dst)] = edge_type[i].item()
+
+    edge_type_undirected = []
+    for i in range(edge_index_undirected.shape[1]):
+        src, dst = edge_index_undirected[0, i].item(), edge_index_undirected[1, i].item()
+        if (src, dst) in edge_type_dict:
+            edge_type_undirected.append(edge_type_dict[(src, dst)])
+        elif (dst, src) in edge_type_dict:
+            edge_type_undirected.append(edge_type_dict[(dst, src)])
+        else:
+            edge_type_undirected.append(0)  # Default to intra-dataset
+
+    edge_type_undirected = torch.tensor(edge_type_undirected, dtype=torch.int32)
+
     data1_x = data1.X.toarray() if hasattr(data1.X, 'toarray') else data1.X
     data2_new_x = data2_new.X.toarray() if hasattr(data2_new.X, 'toarray') else data2_new.X
-    # Concatenate the node features
-    x = np.concatenate([data1_x, data2_new_x],axis=0) # get node features
+    x = np.concatenate([data1_x, data2_new_x], axis=0)
     x = torch.from_numpy(x).to(torch.float32)
     num_nodes = data1.shape[0] + data2.shape[0]
-    return x, edge_index, bias, num_nodes
+
+    return x, edge_index_undirected, bias, num_nodes, edge_type_undirected
 
 # For Improved Spatial Imputation with scGALA: Two-Stage Data Module
 import os

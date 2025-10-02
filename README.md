@@ -16,20 +16,18 @@ conda create -n scGALA python=3.10 -y
 conda activate scGALA
 ``` 
 **Step 2**:
-Install Pytorch as described in its [official documentation](https://pytorch.org/get-started/locally/). Choose the platform and accelerator (GPU/CPU) accordingly to avoid common dependency issues. Currently the DGL package requires Pytorch <= 2.4.0.
+Install Pytorch as described in its [official documentation](https://pytorch.org/get-started/locally/). Choose the platform and accelerator (GPU/CPU) accordingly to avoid common dependency issues.
 
-> **A note regarding DGL for required package PyGCL and PyG**
+> **A note regarding Additional Libraries for required package PyG**
 >
-> Currently the DGL team maintains two versions, `dgl` for CPU support and `dgl-cu***` for CUDA support. Since `pip` treats them as different packages, it is hard for PyGCL to check for the version requirement of `dgl`. They have removed such dependency checks for `dgl` in their setup configuration and require the users to [install a proper version](https://www.dgl.ai/pages/start.html) by themselves. It is the same with required Additional Libraries in [PyG](https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html), please install the optional additional dependencies accordingly after install scGALA.
+> For required additional libraries in [PyG](https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html), it is hard for PyPI to determine the correct version to install. Please install the additional dependencies accordingly after install scGALA.
 
 ```bash
 # Pytorch example, choose the cuda version accordingly
 pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
 # Install scGALA
 pip install scGALA
-# Example for DGL and PyG additional dependencies. Please read the note and install them based on your actual hardware.
-# DGL
-pip install  dgl -f https://data.dgl.ai/wheels/torch-2.4/cu121/repo.html
+# Example for PyG additional dependencies. Please read the note and install them based on your actual hardware.
 # PyG
 pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
 ``` 
@@ -100,6 +98,13 @@ The main function for cell alignment between two datasets.
 - `min_value`: Minimum alignment score threshold (default: 0.9)
 - `lamb`: Hyperparameter for score-based alignment (default: 0.3)
 - `spatial`: Whether to use spatial information in alignment (default: False)
+- `replace`: bool, default=False (Include the initial anchors).
+        Whether to not include the initial anchors in the final alignments
+- `masking_ratio` : float, default=0.3
+        Ratio of masked edges during training
+- `inter_edge_mask_weight` : float, default=0.5 (uniform masking).
+        Weight for masking inter-dataset edges during model training.
+        Higher values mean more inter-dataset edges will be removed during augmentation.
 
 **Returns:** Matrix of alignment probabilities between cells in the two datasets
 
