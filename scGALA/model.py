@@ -25,7 +25,7 @@ from torch import Tensor
 import anndata as ad
 import numpy as np
 import gc
-from .utils import TypedEdgeRemoving
+from .utils import TypedEdgeRemoving,cross_dist,CosineLoss
 
 # Constants
 EPS = 1e-15
@@ -388,10 +388,10 @@ class MSVGAE_gcl_spatialGW(L.LightningModule):
     def predict_step(self, batch, batch_idx) -> Any:
         if len(batch) == 9:  # With edge_type and spatial_edge_type
             x, edge_index, bias, num_nodes, C1, C2, spatial_edge_index, edge_type, spatial_edge_type = batch
-            x, edge_index = x[0], edge_index[0]
+            x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
         else:
             x, edge_index, bias, num_nodes, C1, C2, spatial_edge_index = batch
-            x, edge_index = x[0], edge_index[0]
+            x, edge_index, bias, num_nodes = x[0], edge_index[0], bias[0], num_nodes[0]
         z = self.model.encode(x, edge_index)
         return z
 
@@ -692,8 +692,8 @@ class TwoStageGNNImputer(L.LightningModule):
     def __init__(self, num_features, n_matching_genes, hidden_channels=512, num_layers=3, 
                  layer_type='ClusterGCN', dropout=0.3, lr=1e-3, stage1_epochs=500, 
                  similarity_weight=0.5, alignment_lr=1e-4, alignment_devices=None,
-                 alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=1e-4,
-                 stage1_patience=10, stage1_min_delta=1e-4):
+                 alignment_update_freq_delta=50, stage2_patience=20, stage2_min_delta=1e-4,
+                 stage1_patience=10, stage1_min_delta=1e-4, lam_genegraph=0.1):
         super().__init__()
         self.save_hyperparameters()
         
@@ -729,7 +729,10 @@ class TwoStageGNNImputer(L.LightningModule):
         self.alignment_update_freq = 1
         self.alignment_update_freq_delta = alignment_update_freq_delta
         self.sn_sn_similarity = None
-        
+        self.lam_genegraph = lam_genegraph
+        self.genegraph_loss = CosineLoss()  # Initialize the gene graph loss
+        self.sn_genegraph = None  # Cache for SN_genegraph
+
     def setup_indices(self, sn_size, st_size):
         """Setup indices for SN and ST data"""
         sn_size = int(sn_size)
@@ -776,7 +779,7 @@ class TwoStageGNNImputer(L.LightningModule):
         print('Alignment matrix computed at epoch:', self.current_epoch_stage)
         return torch.tensor(alignment_matrix, device=self.device, dtype=torch.float32)
     
-    def compute_similarity_matrices(self, data, k=10, sparse=True):
+    def compute_similarity_matrices(self, data, k=20, sparse=True):
         """Compute sparse pairwise similarity matrices using cosine similarity with K-NN, preserving gradients."""
         # Normalize data
         data_norm = F.normalize(data, p=2, dim=1)
@@ -816,40 +819,55 @@ class TwoStageGNNImputer(L.LightningModule):
             self.alignment_update_freq_delta += self.alignment_update_freq_delta
             # This can make similarity loss suddenly large if alignment changes significantly, so need to reset early stopping
             self.stage2_best_loss = float('inf')
-        
+            st_sn_alignment = self.sn_st_alignment.t()  # Transpose to get ST-SN
+            # Row-normalize alignment matrices (each row sums to 1)
+            self.st_sn_alignment_norm = F.normalize(st_sn_alignment, p=1, dim=1).detach()
+            self.sn_st_alignment_norm = F.normalize(self.sn_st_alignment, p=1, dim=1).detach()
+            print('Alignment matrices updated at epoch:', self.current_epoch)
+
         # Compute similarity matrices
         if self.sn_sn_similarity is None:
             self.sn_sn_similarity = self.compute_similarity_matrices(sn_data,sparse=True,k=20)
-        st_st_similarity = self.compute_similarity_matrices(st_data, sparse=False)
+            self.sn_sn_similarity = self.sn_sn_similarity.detach()  # Detach to prevent gradients
+            actual_flat_sn = self.sn_sn_similarity.flatten()
+            self.actual_norm_sn = F.normalize(actual_flat_sn.unsqueeze(0), p=2, dim=1)
+            
+        st_st_similarity = self.compute_similarity_matrices(st_data, sparse=False,k=20)
         
         # Expected ST-ST similarity based on SN-SN similarity and SN-ST alignment
         # expected_st_st = ST-SN @ SN-SN @ SN-ST
-        st_sn_alignment = self.sn_st_alignment.t()  # Transpose to get ST-SN
-        # Row-normalize alignment matrices (each row sums to 1)
-        st_sn_alignment_norm = F.normalize(st_sn_alignment, p=1, dim=1)
-        sn_st_alignment_norm = F.normalize(self.sn_st_alignment, p=1, dim=1)
+        
         expected_st_st_similarity = torch.mm(
-            torch.mm(st_sn_alignment_norm, self.sn_sn_similarity), 
-            sn_st_alignment_norm
+            torch.mm(self.st_sn_alignment_norm, self.sn_sn_similarity), 
+            self.sn_st_alignment_norm
+        )
+        expected_sn_sn_similarity = torch.mm(
+            torch.mm(self.sn_st_alignment_norm, st_st_similarity), 
+            self.st_sn_alignment_norm
         )
         
         # Compute cosine similarity between expected and actual ST-ST similarities
-        expected_flat = expected_st_st_similarity.flatten()
-        actual_flat = st_st_similarity.flatten()
+        expected_flat_st = expected_st_st_similarity.flatten()
+        actual_flat_st = st_st_similarity.flatten()
+        expected_flat_sn = expected_sn_sn_similarity.flatten()
         
         # Normalize vectors
-        expected_norm = F.normalize(expected_flat.unsqueeze(0), p=2, dim=1)
-        actual_norm = F.normalize(actual_flat.unsqueeze(0), p=2, dim=1)
+        expected_norm_st = F.normalize(expected_flat_st.unsqueeze(0), p=2, dim=1)
+        actual_norm_st = F.normalize(actual_flat_st.unsqueeze(0), p=2, dim=1)
+        expected_norm_sn = F.normalize(expected_flat_sn.unsqueeze(0), p=2, dim=1)
         
         # Compute cosine similarity (we want to maximize this, so minimize 1 - similarity)
-        cosine_sim = F.cosine_similarity(expected_norm, actual_norm, dim=1)
-        similarity_loss = 1 - cosine_sim.mean()
-        
-        return similarity_loss, {
+        cosine_sim_st = F.cosine_similarity(expected_norm_st, actual_norm_st, dim=1)
+        similarity_loss_st = 1 - cosine_sim_st.mean()
+        cosine_sim_sn = F.cosine_similarity(expected_norm_sn, self.actual_norm_sn, dim=1)
+        similarity_loss_sn = 1 - cosine_sim_sn.mean()
+
+        return similarity_loss_st, similarity_loss_sn, {
             'sn_st_alignment': self.sn_st_alignment,
             'expected_st_st_similarity': expected_st_st_similarity,
             'actual_st_st_similarity': st_st_similarity,
-            'cosine_similarity': cosine_sim.mean()
+            'cosine_similarity_st': cosine_sim_st.mean(),
+            'cosine_similarity_sn': cosine_sim_sn.mean()
         }
     
     def training_step(self, batch, batch_idx):
@@ -909,11 +927,11 @@ class TwoStageGNNImputer(L.LightningModule):
             st_data = x_hat[self.st_indices]
             
             # Compute similarity loss with proper gradient flow
-            similarity_loss, similarity_info = self.compute_similarity_loss(sn_data, st_data)
+            similarity_loss_st, similarity_loss_sn, similarity_info = self.compute_similarity_loss(sn_data, st_data)
             
             # Combined loss
-            total_loss = imputation_loss + self.similarity_weight * similarity_loss
-            
+            total_loss = imputation_loss + self.similarity_weight * similarity_loss_st + self.similarity_weight * similarity_loss_sn
+
             # Early stopping logic for stage 2
             if total_loss < self.stage2_best_loss - self.stage2_min_delta:
                 self.stage2_best_loss = total_loss.item()
@@ -932,13 +950,32 @@ class TwoStageGNNImputer(L.LightningModule):
             # Logging
             self.log('stage2_loss', total_loss, batch_size=1, prog_bar=True)
             self.log('imputation_loss', imputation_loss, batch_size=1, prog_bar=True)
-            self.log('similarity_loss', similarity_loss, batch_size=1, prog_bar=True)
-            self.log('cosine_similarity', similarity_info['cosine_similarity'], batch_size=1)
+            self.log('similarity_loss_st', similarity_loss_st, batch_size=1, prog_bar=True)
+            self.log('similarity_loss_sn', similarity_loss_sn, batch_size=1, prog_bar=True)
+            self.log('cosine_similarity_st', similarity_info['cosine_similarity_st'], batch_size=1)
+            self.log('cosine_similarity_sn', similarity_info['cosine_similarity_sn'], batch_size=1)
             self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
             self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
             self.log('stage2_wait', self.stage2_wait, batch_size=1)
             self.log('stage2_best_loss', self.stage2_best_loss, batch_size=1)
         
+        # Compute SN_genegraph once and cache it
+        if self.sn_genegraph is None:
+            self.sn_genegraph = cross_dist(x[self.sn_indices, :self.hparams.n_matching_genes],x[self.sn_indices, self.hparams.n_matching_genes:])
+            self.sn_genegraph = self.sn_genegraph.detach()  # Detach to avoid gradient computation
+
+        # Compute ST_genegraph dynamically
+        st_genegraph = cross_dist(x[self.st_indices, :self.hparams.n_matching_genes], x_hat[self.st_indices, self.hparams.n_matching_genes:])
+
+        # Compute gene graph loss
+        loss_genegraph = self.genegraph_loss(st_genegraph, self.sn_genegraph)
+
+        # Add gene graph loss to the total loss
+        total_loss = total_loss + self.lam_genegraph * loss_genegraph
+
+        # Log the gene graph loss
+        self.log('loss_genegraph', loss_genegraph, batch_size=1, prog_bar=True)
+
         return total_loss
     
     def on_train_epoch_end(self):

@@ -656,3 +656,41 @@ class TypedEdgeRemoving:
             mask.scatter_(0, inter_idx[mask_inter], True)
         
         return x, edge_index[:, mask], edge_type[mask]
+    
+# For spaital imputation
+def cross_dist(data1, data2, method='correlation'):
+    """n * k1, n * k2 --> k1 * k2
+
+    Parameters
+    ----------
+    method : str, optional
+        ['correlation', 'cosine']
+    """
+    if method == 'correlation':
+        data1_demean = (data1 - data1.mean(dim=0).unsqueeze(0))
+        data2_demean = (data2 - data2.mean(dim=0).unsqueeze(0))
+        
+        
+        cov = torch.einsum('ij, ik -> jk', data1_demean, data2_demean) / (data1_demean.shape[0]-1)
+        var1 = torch.einsum('ij -> j', data1_demean**2) / (data1_demean.shape[0]-1)
+        var2 = torch.einsum('ij -> j', data2_demean**2) / (data2_demean.shape[0]-1)
+        out = cov / ((var1.unsqueeze(-1)* var2.unsqueeze(0)+1e-6)**.5)
+    if method == 'cosine':
+        numerator = torch.einsum('ij, ik -> jk', data1, data2)
+        denominator = (torch.einsum('ij -> j', data1**2).unsqueeze(-1) * torch.einsum('ij -> j', data2**2).unsqueeze(0))**.5
+        out = numerator / denominator
+    
+    return out
+
+class CosineLoss(nn.Module):
+    
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, x, y):
+        x_l2_sqr = (x**2).sum(dim=0)
+        y_l2_sqr = (y**2).sum(dim=0)
+        r = torch.sum(x*y, dim=0) / (x_l2_sqr * y_l2_sqr + 1e-6)**.5
+        r = torch.mean(r)
+        loss = 1 - r
+        return loss
