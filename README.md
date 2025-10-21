@@ -1,5 +1,5 @@
 # scGALA
-scGala: Graph Link Prediction Based Cell Alignment for Comprehensive Data Integration
+scGALA advances graph link prediction–based cell alignment for comprehensive data integration and harmonization
 
 For detailed instructions, comprehensive documentation, and helpful tutorials, please visit: 
 - https://scgala.readthedocs.io/en/latest/intro.html
