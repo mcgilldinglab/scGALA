@@ -288,27 +288,30 @@ def select_centroid_patient(adata, method='pca', patient_key='patient'):
         coords = adata.obsm['X_pca']
     patients = adata.obs[patient_key].unique()
     centroids = []
+    valid_patients = []
     for p in patients:
         idx = adata.obs[patient_key] == p
-        centroids.append(coords[idx].mean(axis=0))
+        if idx.sum() > 200:  # Ensure the patient has more than 200 cells
+            centroids.append(coords[idx].mean(axis=0))
+            valid_patients.append(p)
     centroids = np.vstack(centroids)
     overall_centroid = coords.mean(axis=0)
     dists = np.linalg.norm(centroids - overall_centroid, axis=1)
-    centroid_patient = patients[np.argmin(dists)]
+    centroid_patient = valid_patients[np.argmin(dists)]
     return centroid_patient
 
-def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patient=None, devices=[0], force_recompute=False, patient_key='patient', centroid_method='pca',spatial=False,use_scGALA=True):
+def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patient=None, devices=[0], force_recompute=False, patient_key='patient', centroid_method='pca',spatial=False,use_scGALA=True,verbose=False):
     """
     Construct inter-sample edges using scGALA between all patients and the centroid patient.
     Save as a dict: {patient: edge_index (2, N_edges)}.
     """
+    from .main import get_alignments
     if os.path.exists(save_path) and not force_recompute:
         with open(save_path, 'rb') as f:
             edge_dict = pickle.load(f)
         print(f"Loaded inter-sample edges from {save_path}")
         return edge_dict
-
-    from .main import get_alignments
+    
     patients = adata.obs[patient_key].unique()
     if centroid_patient is None:
         centroid_patient = select_centroid_patient(adata, method=centroid_method, patient_key=patient_key)
@@ -322,9 +325,11 @@ def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patien
             continue
         idx = adata.obs[patient_key] == p
         adata_other = adata[idx].copy()
+        if adata_other.shape[0] <= 200:
+            continue
         align_matrix = get_alignments(
             adata1=adata_other, adata2=adata_centroid, k=k, min_value=0.9, lamb=0.3, devices=devices,
-            get_matrix=True, scale=True,spatial=spatial,only_mnn=only_mnn
+            get_matrix=True, scale=True,spatial=spatial,only_mnn=only_mnn,verbose=verbose
         )
         src, tgt = align_matrix.nonzero()
         src_global = np.where(idx)[0][src]
@@ -346,7 +351,7 @@ class TwoStageDataModule(L.LightningDataModule):
                  mnn1=None, mnn2=None, batch_size=1,
                  sn_inter_edges_path=None, st_inter_edges_path=None,
                  sn_centroid=None, st_centroid=None, devices=[0], force_recompute=False,
-                 patient_key='patient', centroid_method='pca',use_scGALA=True):
+                 patient_key='patient', centroid_method='pca',use_scGALA=True,verbose=False):
         super().__init__()
         self.batch_size = batch_size
         sc.pp.pca(adata_sn)
@@ -372,7 +377,7 @@ class TwoStageDataModule(L.LightningDataModule):
             sn_inter_edges_path = './sn_inter_edges.pkl'
         sn_inter_edges = construct_and_save_intersample_edges(
             reordered_adata_sn, sn_inter_edges_path, k=k, centroid_patient=sn_centroid, devices=devices,
-            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method,spatial=False,use_scGALA=use_scGALA
+            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method,spatial=False,use_scGALA=use_scGALA,verbose=verbose
         )
 
         # --- Inter-sample edges for ST ---
@@ -380,7 +385,7 @@ class TwoStageDataModule(L.LightningDataModule):
             st_inter_edges_path = './st_inter_edges.pkl'
         st_inter_edges = construct_and_save_intersample_edges(
             adata_st_common, st_inter_edges_path, k=k, centroid_patient=st_centroid, devices=devices,
-            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method, spatial=True,use_scGALA=use_scGALA
+            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method, spatial=True,use_scGALA=use_scGALA,verbose=verbose
         )
 
         # --- Intra-sample edges ---
@@ -388,6 +393,8 @@ class TwoStageDataModule(L.LightningDataModule):
         sn_edges = []
         for p in sn_patients:
             idx = reordered_adata_sn.obs[patient_key] == p
+            if idx.sum() <= 200:
+                continue
             X = reordered_adata_sn.obsm['X_pca'][idx]
             local_indices = np.where(idx)[0]
             knn = kneighbors_graph(X, k, mode='distance').tocoo()
@@ -399,6 +406,8 @@ class TwoStageDataModule(L.LightningDataModule):
         st_spatial_edges = []
         for p in st_patients:
             idx = adata_st_common.obs[patient_key] == p
+            if idx.sum() <= 200:
+                continue
             X = adata_st_common.obsm['X_pca'][idx]
             local_indices = np.where(idx)[0]
             knn = kneighbors_graph(X, k, mode='distance').tocoo()
@@ -430,17 +439,36 @@ class TwoStageDataModule(L.LightningDataModule):
         # ST edges: offset by bias
         st_all_edges_offset = st_all_edges + bias
         # MNN edges (if provided)
-        if mnn1 is not None and mnn2 is not None:
-            mnn_edges = np.stack([np.array(mnn1), np.array(mnn2)+bias], axis=0)
-        else:
-            mnn_edges = np.zeros((2,0), dtype=int)
+        if mnn1 is None or mnn2 is None:
+            from .main import get_alignments
+            alignments_matrix = get_alignments(
+                adata1=reordered_adata_sn[:, adata_st_common.var_names],
+                adata2=adata_st_common,
+                min_value=0.9,
+                lamb=0.8,
+                devices=[1],
+                lr=1e-3,
+                replace=True,
+                min_epochs=20,
+                scale=True
+            )
+            mnn1 , mnn2 = alignments_matrix.nonzero()
+        if isinstance(mnn1[0], str):
+            mnn1 = reordered_adata_sn.obs_names.get_indexer(mnn1)
+        if isinstance(mnn2[0], str):
+            mnn2 = adata_st_common.obs_names.get_indexer(mnn2)
+        mnn_edges = np.stack([mnn1, mnn2 + bias], axis=0)
         # Final edge_index
         edge_index = np.concatenate([sn_all_edges, st_all_edges_offset, mnn_edges], axis=1)
-        edge_index = to_undirected(torch.from_numpy(edge_index)).to(torch.int32)
-
+        edge_index = to_undirected(torch.from_numpy(edge_index)).to(torch.int64)
         # Node features
         data1_x = reordered_adata_sn.X.toarray() if hasattr(reordered_adata_sn.X, 'toarray') else reordered_adata_sn.X
         data2_x = adata_st_common.X.toarray() if hasattr(adata_st_common.X, 'toarray') else adata_st_common.X
+
+        # Pad ST data features with zeros to match the length of SN data features
+        if data2_x.shape[1] < data1_x.shape[1]:
+            padding = np.zeros((data2_x.shape[0], data1_x.shape[1] - data2_x.shape[1]), dtype=data2_x.dtype)
+            data2_x = np.hstack([data2_x, padding])
         x = np.concatenate([data1_x, data2_x], axis=0)
         x = torch.from_numpy(x).to(torch.float32)
         self.x = x

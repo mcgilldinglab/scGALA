@@ -1,10 +1,11 @@
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-import warnings
+import warnings, logging
 import scanpy as sc
 import gc
 from .model import MSVGAE_gcl,MSVGAE_gcl_spatialGW,TwoStageGNNImputer
 from .data import MyDataModule,TwoStageDataModule
+import lightning as pl
 from lightning import Trainer
 from lightning.pytorch.callbacks import EarlyStopping,ModelSummary,ModelCheckpoint
 from typing import Literal
@@ -22,7 +23,7 @@ warnings.filterwarnings('ignore', '.*deprecated.*')
 torch.set_float32_matmul_precision('medium')
 EPS = 1e-15
 
-def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20, min_value=0.9, default_root_dir=None,max_epochs:int = 30,lamb = 0.3,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',get_latent:bool = False, get_edge_probs:bool = False, get_matrix:bool = True,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False, masking_ratio=0.3,inter_edge_mask_weight:float = 0.5):
+def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20, min_value=0.9, default_root_dir=None,max_epochs:int = 30,lamb = 0.3,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',get_latent:bool = False, get_edge_probs:bool = False, get_matrix:bool = True,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False, masking_ratio=0.3,inter_edge_mask_weight:float = 0.5, verbose:bool=True):
     '''
     To get the alignments as a matrix showing the possibility of their alignment and the unaligned pairs are set to zero.
     Provide either the dir of adata with data_dirs or directly provide adatas.
@@ -86,12 +87,27 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
     inter_edge_mask_weight : float, default=0.5
         Weight for masking inter-dataset edges during model training.
         Higher values mean more inter-dataset edges will be removed during augmentation.
-        
+    verbose : bool, default=True
+        Whether to print detailed logs during training.
+
     Returns
     -------
     ndarray
         Matrix of alignment probabilities between cells in the two datasets
     '''
+    if not verbose:
+        # Suppress warnings
+        warnings.filterwarnings('ignore')
+        pl._logger.setLevel('ERROR')
+        logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+        logging.getLogger("pytorch_lightning.utilities.rank_zero").setLevel(logging.ERROR)
+        logging.getLogger("pytorch_lightning.accelerators.cuda").setLevel(logging.ERROR)
+
+        enable_progress_bar = False
+        enable_model_summary = False
+    else:
+        enable_progress_bar = True
+        enable_model_summary = True
     if (not data1_dir is None) and (not data2_dir is None):
         data1 = sc.read(data1_dir)
         data2 = sc.read(data2_dir)
@@ -114,10 +130,10 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         
     if mnns is None:
         if not transformed:
-            mnn1, mnn2 = find_mutual_nn(data1.X,data2.X,k1=k,k2=k,transformed=transformed,n_jobs=-1)
+            mnn1, mnn2 = find_mutual_nn(data1.X,data2.X,k1=k,k2=k,transformed=transformed,n_jobs=-1,verbose=verbose)
             # print('finished mnn')
         else:
-            mnn1, mnn2 = find_mutual_nn(transformed_datas[0],transformed_datas[1],k1=k,k2=k,transformed=transformed,n_jobs=-1)
+            mnn1, mnn2 = find_mutual_nn(transformed_datas[0],transformed_datas[1],k1=k,k2=k,transformed=transformed,n_jobs=-1,verbose=verbose)
     else:
         mnn1, mnn2 = mnns
         if len(mnn1)==0 or len(mnn2)==0:
@@ -140,7 +156,7 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
     else:
         early_stopping = EarlyStopping('ap',patience=3,mode='max',min_delta=0.01)#,stopping_threshold=0.95
         Model = MSVGAE_gcl_spatialGW
-    trainer = Trainer(max_epochs=max_epochs,devices=devices,log_every_n_steps=1,callbacks=[early_stopping,ModelSummary(max_depth=1)],default_root_dir=default_root_dir,min_epochs=min_epochs)#,RichProgressBar()
+    trainer = Trainer(max_epochs=max_epochs,devices=devices,log_every_n_steps=1,callbacks=[early_stopping],default_root_dir=default_root_dir,min_epochs=min_epochs,enable_progress_bar=enable_progress_bar,enable_model_summary=enable_model_summary)
     print('start to train')
     if ckpt_dir is None:
         # model = VGAE_gcl(out_channels=out_channels,dropout=dropout,lr=lr,use_scheduler=use_scheduler,optimizer=optimizer)

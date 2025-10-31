@@ -46,21 +46,25 @@ def timing(f):
 #                 mutual_2.append(index_2)
 #     return mutual_1, mutual_2
 
-@timing
-def find_mutual_nn(data1, data2, k1, k2, transformed, n_jobs):
+# @timing
+def find_mutual_nn(data1, data2, k1, k2, transformed, n_jobs,verbose=True):
     if not transformed:
-        print('normalizing')
+        if verbose:
+            print('normalizing')
         data1 = normalize(data1, norm='l2')
         data2 = normalize(data2, norm='l2')
-        print('normalization done')
+        if verbose:
+            print('normalization done')
     
     # Build KD-Trees and query nearest neighbors
     tree1 = cKDTree(data1)
     tree2 = cKDTree(data2)
-    print('tree done')
+    if verbose:
+        print('tree done')
     k_index_1 = tree1.query(x=data2, k=k1, workers=n_jobs)[1]
     k_index_2 = tree2.query(x=data1, k=k2, workers=n_jobs)[1]
-    print('query done')
+    if verbose:
+        print('query done')
     # Create pairs from k_index_1
     n2 = data2.shape[0]
     index2s = np.repeat(np.arange(n2), k1)
@@ -682,7 +686,7 @@ def cross_dist(data1, data2, method='correlation'):
     
     return out
 
-class CosineLoss(nn.Module):
+class CosineLoss(torch.nn.Module):
     
     def __init__(self):
         super().__init__()

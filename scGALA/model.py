@@ -12,6 +12,7 @@ from torch_geometric.nn import (
     ClusterGCNConv,
     AGNNConv,
     EGConv,
+    SAGEConv,
     InnerProductDecoder,
     Sequential
 )
@@ -623,6 +624,9 @@ class GNNImputer(L.LightningModule):
         elif layer_type == 'EGConv':
             conv_layer = EGConv
             GAT = False
+        elif layer_type == 'SAGE':
+            conv_layer = SAGEConv
+            GAT = False
         else:
             raise ValueError(f"Invalid layer type: {layer_type}")
         
@@ -876,7 +880,9 @@ class TwoStageGNNImputer(L.LightningModule):
             return None
             
         x, edge_index, bias = batch.x, batch.edge_index, batch.bias
-        
+        # Apply feature masking
+        mask = torch.FloatTensor(x.shape[0], x.shape[1]).uniform_() > 0.3
+        x = x * mask.to(x.device)
         # Setup indices if not done
         if self.sn_indices is None:
             sn_size = bias
