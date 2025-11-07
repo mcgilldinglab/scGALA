@@ -697,7 +697,9 @@ class TwoStageGNNImputer(L.LightningModule):
                  layer_type='ClusterGCN', dropout=0.3, lr=1e-3, stage1_epochs=500, 
                  similarity_weight=0.5, alignment_lr=1e-4, alignment_devices=None,
                  alignment_update_freq_delta=50, stage2_patience=20, stage2_min_delta=1e-4,
-                 stage1_patience=10, stage1_min_delta=1e-4, lam_genegraph=0.1):
+                 stage1_patience=10, stage1_min_delta=1e-4, lam_genegraph=0.1,
+                 discriminator_hidden=256, discriminator_lr=1e-3, adv_weight=0.05,
+                 discriminator_steps=1, generator_steps=1):
         super().__init__()
         self.save_hyperparameters()
         
@@ -736,6 +738,20 @@ class TwoStageGNNImputer(L.LightningModule):
         self.lam_genegraph = lam_genegraph
         self.genegraph_loss = CosineLoss()  # Initialize the gene graph loss
         self.sn_genegraph = None  # Cache for SN_genegraph
+        self.automatic_optimization = False
+        disc_in_features = max(1, int(self.hparams.n_matching_genes))
+        hidden_mid = max(1, discriminator_hidden // 2)
+        self.discriminator = nn.Sequential(
+            nn.Linear(disc_in_features, discriminator_hidden),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(discriminator_hidden, hidden_mid),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden_mid, 1)
+        )
+        self.adv_loss_fn = nn.BCEWithLogitsLoss()
+        self.generator_steps = generator_steps
+        self.discriminator_steps = discriminator_steps
 
     def setup_indices(self, sn_size, st_size):
         """Setup indices for SN and ST data"""
@@ -879,160 +895,167 @@ class TwoStageGNNImputer(L.LightningModule):
         if self.stage2_stopped:
             return None
             
-        x, edge_index, bias = batch.x, batch.edge_index, batch.bias
-        # Apply feature masking
-        mask = torch.FloatTensor(x.shape[0], x.shape[1]).uniform_() > 0.3
-        x = x * mask.to(x.device)
-        # Setup indices if not done
+        optimizer_g, optimizer_d = self.optimizers()
+
+        x_original, edge_index, bias = batch.x, batch.edge_index, batch.bias
+        mask = torch.rand_like(x_original) > 0.3
+        x = x_original * mask.to(x_original.device)
+
         if self.sn_indices is None:
             sn_size = bias
             st_size = x.size(0) - bias
             self.setup_indices(sn_size, st_size)
-        
-        # Forward pass
+
         x_hat = self(x, edge_index)
-        
-        # Stage 1: Regular imputation loss
+
         loss_sn = F.mse_loss(x_hat[self.sn_indices], x[self.sn_indices])
-        loss_st = F.mse_loss(x_hat[self.st_indices, :self.hparams.n_matching_genes], 
-                            x[self.st_indices, :self.hparams.n_matching_genes])
+        loss_st = F.mse_loss(
+            x_hat[self.st_indices, :self.hparams.n_matching_genes],
+            x[self.st_indices, :self.hparams.n_matching_genes]
+        )
         imputation_loss = loss_sn + loss_st
-        
-        # Determine current stage based on both epoch count and stage1_complete flag
+
         is_stage1 = (self.current_epoch < self.stage1_epochs) and (not self.stage1_complete)
-        
+
+        similarity_loss_st = torch.tensor(0.0, device=x.device)
+        similarity_loss_sn = torch.tensor(0.0, device=x.device)
+        similarity_info = None
+        if not is_stage1:
+            sn_data = x[self.sn_indices]
+            st_data = x_hat[self.st_indices]
+            similarity_loss_st, similarity_loss_sn, similarity_info = self.compute_similarity_loss(sn_data, st_data)
+
+        base_total_loss = imputation_loss
+        if not is_stage1:
+            base_total_loss = base_total_loss + self.similarity_weight * (similarity_loss_st + similarity_loss_sn)
+
         if is_stage1:
-            # Stage 1: Only imputation loss with early stopping
-            total_loss = imputation_loss
-            
-            # Early stopping logic for stage 1
-            if total_loss < self.stage1_best_loss - self.stage1_min_delta:
-                self.stage1_best_loss = total_loss.item()
+            stage1_metric = base_total_loss
+            if stage1_metric < self.stage1_best_loss - self.stage1_min_delta:
+                self.stage1_best_loss = stage1_metric.item()
                 self.stage1_wait = 0
             else:
                 self.stage1_wait += 1
-                
             if self.stage1_wait >= self.stage1_patience:
                 self.stage1_stopped = True
                 self.stage1_complete = True
                 print(f"Early stopping triggered for Stage 1 at epoch {self.current_epoch}")
                 print("Stage 1 completed early. Switching to Stage 2 with similarity regularization.")
-                # Save stage 1 model
                 self.trainer.save_checkpoint('stage1_early_stopped_model.ckpt')
-                # Reset the current epoch stage to trigger stage 2
                 self.current_epoch_stage = self.stage1_epochs
-            
-            self.log('stage1_loss', total_loss, batch_size=1, prog_bar=True)
+            self.log('stage1_loss', stage1_metric, batch_size=1, prog_bar=True)
             self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
             self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
             self.log('stage1_wait', self.stage1_wait, batch_size=1)
             self.log('stage1_best_loss', self.stage1_best_loss, batch_size=1)
         else:
-            # Stage 2: Imputation + similarity preservation loss
-            sn_data = x[self.sn_indices]
-            st_data = x_hat[self.st_indices]
-            
-            # Compute similarity loss with proper gradient flow
-            similarity_loss_st, similarity_loss_sn, similarity_info = self.compute_similarity_loss(sn_data, st_data)
-            
-            # Combined loss
-            total_loss = imputation_loss + self.similarity_weight * similarity_loss_st + self.similarity_weight * similarity_loss_sn
-
-            # Early stopping logic for stage 2
-            if total_loss < self.stage2_best_loss - self.stage2_min_delta:
-                self.stage2_best_loss = total_loss.item()
+            stage2_metric = base_total_loss
+            if similarity_info is not None:
+                self.log('similarity_loss_st', similarity_loss_st, batch_size=1, prog_bar=True)
+                self.log('similarity_loss_sn', similarity_loss_sn, batch_size=1, prog_bar=True)
+                self.log('cosine_similarity_st', similarity_info['cosine_similarity_st'], batch_size=1)
+                self.log('cosine_similarity_sn', similarity_info['cosine_similarity_sn'], batch_size=1)
+            if stage2_metric < self.stage2_best_loss - self.stage2_min_delta:
+                self.stage2_best_loss = stage2_metric.item()
                 self.stage2_wait = 0
             else:
                 self.stage2_wait += 1
-                
             if self.stage2_wait >= self.stage2_patience:
                 self.stage2_stopped = True
                 print(f"Early stopping triggered for Stage 2 at epoch {self.current_epoch}")
-                # Save the final model
                 self.trainer.save_checkpoint('stage2_final_model.ckpt')
-                # Signal the trainer to stop
                 self.trainer.should_stop = True
-            
-            # Logging
-            self.log('stage2_loss', total_loss, batch_size=1, prog_bar=True)
+            self.log('stage2_base_loss', stage2_metric, batch_size=1, prog_bar=True)
             self.log('imputation_loss', imputation_loss, batch_size=1, prog_bar=True)
-            self.log('similarity_loss_st', similarity_loss_st, batch_size=1, prog_bar=True)
-            self.log('similarity_loss_sn', similarity_loss_sn, batch_size=1, prog_bar=True)
-            self.log('cosine_similarity_st', similarity_info['cosine_similarity_st'], batch_size=1)
-            self.log('cosine_similarity_sn', similarity_info['cosine_similarity_sn'], batch_size=1)
             self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
             self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
             self.log('stage2_wait', self.stage2_wait, batch_size=1)
             self.log('stage2_best_loss', self.stage2_best_loss, batch_size=1)
-        
-        # Compute SN_genegraph once and cache it
+
         if self.sn_genegraph is None:
-            self.sn_genegraph = cross_dist(x[self.sn_indices, :self.hparams.n_matching_genes],x[self.sn_indices, self.hparams.n_matching_genes:])
-            self.sn_genegraph = self.sn_genegraph.detach()  # Detach to avoid gradient computation
-
-        # Compute ST_genegraph dynamically
-        st_genegraph = cross_dist(x[self.st_indices, :self.hparams.n_matching_genes], x_hat[self.st_indices, self.hparams.n_matching_genes:])
-
-        # Compute gene graph loss
+            self.sn_genegraph = cross_dist(
+                x[self.sn_indices, :self.hparams.n_matching_genes],
+                x[self.sn_indices, self.hparams.n_matching_genes:]
+            )
+            self.sn_genegraph = self.sn_genegraph.detach()
+        st_genegraph = cross_dist(
+            x[self.st_indices, :self.hparams.n_matching_genes],
+            x_hat[self.st_indices, self.hparams.n_matching_genes:]
+        )
         loss_genegraph = self.genegraph_loss(st_genegraph, self.sn_genegraph)
-
-        # Add gene graph loss to the total loss
-        total_loss = total_loss + self.lam_genegraph * loss_genegraph
-
-        # Log the gene graph loss
+        total_loss = base_total_loss + self.lam_genegraph * loss_genegraph
         self.log('loss_genegraph', loss_genegraph, batch_size=1, prog_bar=True)
 
-        return total_loss
-    
-    def on_train_epoch_end(self):
-        self.current_epoch_stage += 1
-        
-        # Mark stage 1 completion (only if not already complete from checkpoint loading or early stopping)
-        if (self.current_epoch_stage == self.stage1_epochs and not self.stage1_complete and not self.stage1_stopped):
-            self.stage1_complete = True
-            print(f"Stage 1 completed normally at epoch {self.stage1_epochs}. Switching to Stage 2 with similarity regularization.")
-            print('Saving the stage 1 model')
-            self.trainer.save_checkpoint('stage1_model.ckpt')
-            
-        # Save imputed data after stage 1 completion (either normal or early stopping)
-        if self.stage1_complete and hasattr(self, 'trainer') and hasattr(self.trainer, 'datamodule'):
-            if not hasattr(self, '_stage1_data_saved'):
-                self.imputer.eval()
-                with torch.no_grad():
-                    # Save the imputed data after stage 1
-                    x_hat = self.imputer(self.trainer.datamodule.data.x.to(self.device), 
-                                         self.trainer.datamodule.data.edge_index.to(self.device))
-                    # Extract imputed spatial data
-                    imputed_st = x_hat[self.trainer.datamodule.data.bias:].cpu().numpy()
-                    var_names = np.loadtxt('./var_names_two_stage.txt',dtype=str)[1:].tolist()
-                    # Create new AnnData with imputed results
-                    adata_st_imputed = ad.AnnData(imputed_st)
-                    adata_st_imputed.var_names = var_names
-                    # Save the imputed AnnData object
-                    adata_st_imputed.write('./adata_st_imputed_first_stage.h5ad')
-                    del adata_st_imputed, imputed_st, x_hat
-                    print("Imputed ST data (Stage 1) saved to './adata_st_imputed_first_stage.h5ad'")
-                    self._stage1_data_saved = True
-                self.imputer.train()
+        if is_stage1:
+            self.toggle_optimizer(optimizer_g)
+            optimizer_g.zero_grad()
+            self.manual_backward(total_loss)
+            optimizer_g.step()
+            self.untoggle_optimizer(optimizer_g)
+            return total_loss
+
+        if self.stage2_stopped:
+            self.log('stage2_loss', total_loss, batch_size=1, prog_bar=True)
+            return total_loss
+
+        real_st = x_original#[self.st_indices, :self.hparams.n_matching_genes]
+        fake_st = x_hat#[self.st_indices, :self.hparams.n_matching_genes]
+        fake_detached = fake_st.detach()
+        d_loss = None
+        if real_st.numel() > 0:
+            real_detached = real_st.detach()
+            for step_idx in range(self.discriminator_steps):
+                self.toggle_optimizer(optimizer_d)
+                optimizer_d.zero_grad()
+                d_loss = self._discriminator_loss(real_detached, fake_detached)
+                self.manual_backward(d_loss)
+                optimizer_d.step()
+                self.untoggle_optimizer(optimizer_d)
+
+        generator_loss = total_loss
+        g_adv_loss = None
+        if real_st.numel() > 0:
+            fake_logits = self.discriminator(fake_st)
+            g_adv_loss = self.adv_loss_fn(fake_logits, torch.ones_like(fake_logits))
+            generator_loss = generator_loss + self.hparams.adv_weight * g_adv_loss
+
+        for step_idx in range(self.generator_steps):
+            self.toggle_optimizer(optimizer_g)
+            optimizer_g.zero_grad()
+            retain_graph = step_idx < self.generator_steps - 1
+            self.manual_backward(generator_loss, retain_graph=retain_graph)
+            optimizer_g.step()
+            self.untoggle_optimizer(optimizer_g)
+
+        if d_loss is not None:
+            self.log('d_loss', d_loss, batch_size=1, prog_bar=True)
+        if g_adv_loss is not None:
+            self.log('g_adv_loss', g_adv_loss, batch_size=1, prog_bar=True)
+        self.log('stage2_loss', generator_loss, batch_size=1, prog_bar=True)
+
+        return generator_loss
+
+    def _discriminator_loss(self, real_samples, fake_samples):
+        real_logits = self.discriminator(real_samples)
+        fake_logits = self.discriminator(fake_samples)
+        loss_real = self.adv_loss_fn(real_logits, torch.ones_like(real_logits))
+        loss_fake = self.adv_loss_fn(fake_logits, torch.zeros_like(fake_logits))
+        return 0.5 * (loss_real + loss_fake)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
-        
-        # Learning rate scheduler
+        generator_optimizer = torch.optim.Adam(self.imputer.parameters(), lr=self.hparams.lr)
+        discriminator_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=self.hparams.discriminator_lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=10, verbose=True
+            generator_optimizer, mode='min', factor=0.5, patience=10, verbose=True
         )
-        
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "stage1_loss" if not self.stage1_complete else "stage2_loss",
-            },
-        }
+        return (
+            [generator_optimizer, discriminator_optimizer],
+            [{"scheduler": scheduler, "monitor": "stage1_loss"}],
+        )
 
     def lr_scheduler_step(self, scheduler, optimizer_idx):
-        # Dynamically select the metric to monitor
+        if optimizer_idx != 0:
+            return
         monitor_metric = "stage1_loss" if not self.stage1_complete else "stage2_loss"
         metric_value = self.trainer.callback_metrics.get(monitor_metric)
         if metric_value is not None:

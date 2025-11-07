@@ -395,7 +395,9 @@ def two_stage_spatial_imputation(
     stage1_patience=10, stage1_min_delta=5e-4,
     sn_inter_edges_path=None, st_inter_edges_path=None,
     sn_centroid=None, st_centroid=None, force_recompute=False,
-    patient_key='patient', centroid_method='pca',use_scGALA=True
+    patient_key='patient', centroid_method='pca',use_scGALA=True,
+    adv_weight=0.05, discriminator_hidden=256, discriminator_lr=1e-3,
+    discriminator_steps=1, generator_steps=1
 ):
     """
     Two-stage spatial transcriptomics imputation with similarity preservation
@@ -453,6 +455,16 @@ def two_stage_spatial_imputation(
         Method for centroid selection ('pca' or 'umap')
     use_scGALA : bool, default True
         Whether to use scGALA for inter-sample edge computation
+    adv_weight : float, default 0.05
+        Weight for the adversarial generator objective.
+    discriminator_hidden : int, default 256
+        Hidden dimension for the GAN discriminator.
+    discriminator_lr : float, default 1e-3
+        Learning rate for the discriminator.
+    discriminator_steps : int, default 1
+        Number of discriminator updates per optimization round.
+    generator_steps : int, default 1
+        Number of generator updates per optimization round.
     
     Returns
     -------
@@ -507,7 +519,12 @@ def two_stage_spatial_imputation(
             stage2_patience=stage2_patience, 
             stage2_min_delta=stage2_min_delta,
             stage1_patience=stage1_patience,
-            stage1_min_delta=stage1_min_delta
+            stage1_min_delta=stage1_min_delta,
+            discriminator_hidden=discriminator_hidden,
+            discriminator_lr=discriminator_lr,
+            adv_weight=adv_weight,
+            discriminator_steps=discriminator_steps,
+            generator_steps=generator_steps
         )
         # Mark stage 1 as complete
         model.stage1_complete = True
@@ -547,7 +564,12 @@ def two_stage_spatial_imputation(
             stage2_patience=stage2_patience, 
             stage2_min_delta=stage2_min_delta,
             stage1_patience=stage1_patience,
-            stage1_min_delta=stage1_min_delta
+            stage1_min_delta=stage1_min_delta,
+            discriminator_hidden=discriminator_hidden,
+            discriminator_lr=discriminator_lr,
+            adv_weight=adv_weight,
+            discriminator_steps=discriminator_steps,
+            generator_steps=generator_steps
         )
         
         # Setup trainer for both stages with dynamic early stopping
