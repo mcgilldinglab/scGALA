@@ -8,6 +8,7 @@ from .data import MyDataModule,TwoStageDataModule
 import lightning as pl
 from lightning import Trainer
 from lightning.pytorch.callbacks import EarlyStopping,ModelSummary,ModelCheckpoint
+from lightning.pytorch.profilers import AdvancedProfiler
 from typing import Literal
 import pandas as pd
 from .utils import make_alignments,find_mutual_nn
@@ -221,12 +222,17 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         likelyhood = torch.matmul(latent[:bias], latent[bias:].T).sigmoid()
         likelyhood = np.array(likelyhood.detach().cpu()) # [data1.shape[0],data2.shape[0]]
         likelyhood[likelyhood < min_value] = 0
-        return likelyhood
     # make alignment through score-based greedy algorithm
     if get_matrix:
         alignments_matrix = make_alignments(latent=latent,mnn1=mnn1,mnn2=mnn2,bias=bias,lamb=lamb,min_value=min_value,replace=replace)
         print(f'R:{data1.shape[0]} D:{data2.shape[0]}')
+    
+    if get_matrix and not get_edge_probs:
         return alignments_matrix
+    elif not get_matrix and get_edge_probs:
+        return likelyhood
+    elif get_matrix and get_edge_probs:
+        return alignments_matrix, likelyhood
 
 def find_mutual_nn_new(data1, data2, k1, k2, transformed_datas=None,n_jobs=-1,ckpt_dir = None,only_mnn=False,devices=[0]):
     '''
@@ -386,18 +392,18 @@ def mod_seurat_anchors(anchors_ori="temp/anchors.csv",adata1='temp/adata1.h5ad',
     return anchors_mod
 
 def two_stage_spatial_imputation(
-    adata_sn, adata_st, mnn1=None, mnn2=None, 
-    hidden_channels=128, num_layers=3, layer_type='ClusterGCN',
-    stage1_epochs=1000, similarity_weight=0.5,dropout=0., 
-    max_epochs=-1, lr=1e-3, alignment_lr=1e-3,
+    adata_sn, adata_st, alignment_matrix=None,mnn1=None, mnn2=None,
+    hidden_channels=64, num_layers=3, layer_type='ClusterGCN',
+    stage1_epochs=1000, similarity_weight=0.5,dropout=0.2,gene_masking_percent=0.3,triplet_margin=0.1,triplet_weight=0.1,
+    max_epochs=-1, lr=5e-4, alignment_lr=5e-4,
     devices=[0], alignment_devices=None, k=20,default_root_dir='./logs/two_stage_spatial_imputation',
-    stage1_checkpoint=None,alignment_update_freq_delta=50,stage2_patience=20, stage2_min_delta=5e-4,
+    stage1_checkpoint=None,stage2_patience=20, stage2_min_delta=5e-4,
     stage1_patience=10, stage1_min_delta=5e-4,
     sn_inter_edges_path=None, st_inter_edges_path=None,
     sn_centroid=None, st_centroid=None, force_recompute=False,
-    patient_key='patient', centroid_method='pca',use_scGALA=True,
+    patient_key='patient', centroid_method='pca',use_scGALA=True,lam_genegraph=0.1,
     adv_weight=0.05, discriminator_hidden=256, discriminator_lr=1e-3,
-    discriminator_steps=1, generator_steps=1
+    discriminator_steps=1, generator_steps=1,num_workers=8,return_stage_1 = False,stage1_only=False, mixed_precision = False
 ):
     """
     Two-stage spatial transcriptomics imputation with similarity preservation
@@ -416,6 +422,10 @@ def two_stage_spatial_imputation(
         Number of GNN layers
     layer_type : str, default 'GAT'
         Type of GNN layer
+    dropout : float, default 0.2
+        Dropout rate for GNN layers
+    gene_masking_percent : float, default 0.3
+        Percentage of genes to mask during training for imputation
     stage1_epochs : int, default 50
         Number of epochs for stage 1 (imputation only)
     similarity_weight : float, default 0.5
@@ -479,7 +489,14 @@ def two_stage_spatial_imputation(
     # Set alignment devices to main devices if not specified
     if alignment_devices is None:
         alignment_devices = devices
+    if alignment_matrix is None:
+        print("No alignment matrix provided, calculating alignment.")
+        save_alignment_matrix=True
+    else:
+        save_alignment_matrix=False
     
+    precision = '16-mixed' if mixed_precision else "32"
+        
     # Prepare data
     data_module = TwoStageDataModule(
         adata_sn=adata_sn,
@@ -495,9 +512,13 @@ def two_stage_spatial_imputation(
         force_recompute=force_recompute,
         patient_key=patient_key,
         centroid_method=centroid_method,
-        use_scGALA=use_scGALA
+        use_scGALA=use_scGALA,
+        save_alignment_matrix=save_alignment_matrix,
+        num_workers=num_workers
     )
-    
+    if alignment_matrix is None:
+        alignment_matrix = np.load('alignment_matrix_two_stage.npy')
+    # profiler = AdvancedProfiler(dirpath=".", filename="perf_logs")
     # Initialize model
     if stage1_checkpoint is not None:
         # Load pre-trained stage 1 model
@@ -511,20 +532,24 @@ def two_stage_spatial_imputation(
             layer_type=layer_type,
             lr=lr,
             dropout=dropout,
+            gene_masking_percent=gene_masking_percent,
             stage1_epochs=0,  # Skip stage 1 since we're loading a checkpoint
             similarity_weight=similarity_weight,
+            triplet_margin=triplet_margin,
+            triplet_weight=triplet_weight,
             alignment_lr=alignment_lr,
             alignment_devices=alignment_devices,
-            alignment_update_freq_delta=alignment_update_freq_delta,
             stage2_patience=stage2_patience, 
             stage2_min_delta=stage2_min_delta,
             stage1_patience=stage1_patience,
             stage1_min_delta=stage1_min_delta,
+            lam_genegraph=lam_genegraph,
             discriminator_hidden=discriminator_hidden,
             discriminator_lr=discriminator_lr,
             adv_weight=adv_weight,
             discriminator_steps=discriminator_steps,
-            generator_steps=generator_steps
+            generator_steps=generator_steps,
+            alignment_matrix = alignment_matrix
         )
         # Mark stage 1 as complete
         model.stage1_complete = True
@@ -543,10 +568,14 @@ def two_stage_spatial_imputation(
                 ModelCheckpoint(
                     monitor='stage2_loss',
                     save_top_k=1,
-                    mode='min'
+                    mode='min',
+                    filename='stage2-{epoch:02d}-{stage2_loss:.4f}'
                 )
-            ]
+            ],
+            precision=precision
         )
+        if return_stage_1:
+            return trainer, model, data_module
     else:
         model = TwoStageGNNImputer(
             num_features=data_module.x.shape[1],
@@ -556,22 +585,27 @@ def two_stage_spatial_imputation(
             layer_type=layer_type,
             lr=lr,
             dropout=dropout,
+            gene_masking_percent=gene_masking_percent,
+            triplet_margin=triplet_margin,
+            triplet_weight=triplet_weight,
             stage1_epochs=stage1_epochs,
             similarity_weight=similarity_weight,
             alignment_lr=alignment_lr,
             alignment_devices=alignment_devices,
-            alignment_update_freq_delta=alignment_update_freq_delta,
             stage2_patience=stage2_patience, 
             stage2_min_delta=stage2_min_delta,
             stage1_patience=stage1_patience,
             stage1_min_delta=stage1_min_delta,
             discriminator_hidden=discriminator_hidden,
+            lam_genegraph=lam_genegraph,
             discriminator_lr=discriminator_lr,
             adv_weight=adv_weight,
             discriminator_steps=discriminator_steps,
-            generator_steps=generator_steps
+            generator_steps=generator_steps,
+            alignment_matrix = alignment_matrix,
+            stage1_only = stage1_only
         )
-        
+
         # Setup trainer for both stages with dynamic early stopping
         trainer = Trainer(
             max_epochs=max_epochs,
@@ -593,7 +627,8 @@ def two_stage_spatial_imputation(
                     mode='min',
                     filename='stage2-{epoch:02d}-{stage2_loss:.4f}'
                 )
-            ]
+            ],
+            precision=precision
         )
     
     # Train model

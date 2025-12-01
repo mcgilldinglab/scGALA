@@ -692,7 +692,7 @@ class GNNImputer(L.LightningModule):
         return [optimizer], [lr_scheduler]
 
 # For Improved Spatial Imputation with scGALA
-class TwoStageGNNImputer(L.LightningModule):
+class TwoStageGNNImputer_old(L.LightningModule):
     def __init__(self, num_features, n_matching_genes, hidden_channels=512, num_layers=3, 
                  layer_type='ClusterGCN', dropout=0.3, lr=1e-3, stage1_epochs=500, 
                  similarity_weight=0.5, alignment_lr=1e-4, alignment_devices=None,
@@ -739,7 +739,7 @@ class TwoStageGNNImputer(L.LightningModule):
         self.genegraph_loss = CosineLoss()  # Initialize the gene graph loss
         self.sn_genegraph = None  # Cache for SN_genegraph
         self.automatic_optimization = False
-        disc_in_features = max(1, int(self.hparams.n_matching_genes))
+        disc_in_features = max(1, int(self.hparams.num_features))
         hidden_mid = max(1, discriminator_hidden // 2)
         self.discriminator = nn.Sequential(
             nn.Linear(disc_in_features, discriminator_hidden),
@@ -826,9 +826,16 @@ class TwoStageGNNImputer(L.LightningModule):
         
         return similarity
     
-    def compute_similarity_loss(self, sn_data, st_data):
+    def compute_similarity_loss(self, sn_data, st_data, alignment_matrix):
         """Compute similarity preservation loss"""
         # Get alignment probabilities between SN and ST
+        if not hasattr(self, 'st_sn_alignment_norm'):
+            sn_st_alignment = alignment_matrix
+            st_sn_alignment = alignment_matrix.t()
+            # Row-normalize alignment matrices (each row sums to 1)
+            self.st_sn_alignment_norm = F.normalize(st_sn_alignment, p=1, dim=1).detach()
+            self.sn_st_alignment_norm = F.normalize(sn_st_alignment, p=1, dim=1).detach()
+            
         if (self.current_epoch - self.stage1_epochs) % self.alignment_update_freq == 0:
             # Clear previous alignment matrix to free memory
             if hasattr(self, 'sn_st_alignment'):
@@ -897,7 +904,7 @@ class TwoStageGNNImputer(L.LightningModule):
             
         optimizer_g, optimizer_d = self.optimizers()
 
-        x_original, edge_index, bias = batch.x, batch.edge_index, batch.bias
+        x_original, edge_index, bias, alignment_matrix = batch.x, batch.edge_index, batch.bias, batch.alignment_matrix
         mask = torch.rand_like(x_original) > 0.3
         x = x_original * mask.to(x_original.device)
 
@@ -923,7 +930,7 @@ class TwoStageGNNImputer(L.LightningModule):
         if not is_stage1:
             sn_data = x[self.sn_indices]
             st_data = x_hat[self.st_indices]
-            similarity_loss_st, similarity_loss_sn, similarity_info = self.compute_similarity_loss(sn_data, st_data)
+            similarity_loss_st, similarity_loss_sn, similarity_info = self.compute_similarity_loss(sn_data, st_data, alignment_matrix)
 
         base_total_loss = imputation_loss
         if not is_stage1:
@@ -955,22 +962,11 @@ class TwoStageGNNImputer(L.LightningModule):
                 self.log('similarity_loss_sn', similarity_loss_sn, batch_size=1, prog_bar=True)
                 self.log('cosine_similarity_st', similarity_info['cosine_similarity_st'], batch_size=1)
                 self.log('cosine_similarity_sn', similarity_info['cosine_similarity_sn'], batch_size=1)
-            if stage2_metric < self.stage2_best_loss - self.stage2_min_delta:
-                self.stage2_best_loss = stage2_metric.item()
-                self.stage2_wait = 0
-            else:
-                self.stage2_wait += 1
-            if self.stage2_wait >= self.stage2_patience:
-                self.stage2_stopped = True
-                print(f"Early stopping triggered for Stage 2 at epoch {self.current_epoch}")
-                self.trainer.save_checkpoint('stage2_final_model.ckpt')
-                self.trainer.should_stop = True
+
             self.log('stage2_base_loss', stage2_metric, batch_size=1, prog_bar=True)
             self.log('imputation_loss', imputation_loss, batch_size=1, prog_bar=True)
             self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
             self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
-            self.log('stage2_wait', self.stage2_wait, batch_size=1)
-            self.log('stage2_best_loss', self.stage2_best_loss, batch_size=1)
 
         if self.sn_genegraph is None:
             self.sn_genegraph = cross_dist(
@@ -1018,6 +1014,416 @@ class TwoStageGNNImputer(L.LightningModule):
             fake_logits = self.discriminator(fake_st)
             g_adv_loss = self.adv_loss_fn(fake_logits, torch.ones_like(fake_logits))
             generator_loss = generator_loss + self.hparams.adv_weight * g_adv_loss
+        if generator_loss < self.stage2_best_loss - self.stage2_min_delta:
+            self.stage2_best_loss = generator_loss.item()
+            self.stage2_wait = 0
+        else:
+            self.stage2_wait += 1
+        if self.stage2_wait >= self.stage2_patience:
+            self.stage2_stopped = True
+            print(f"Early stopping triggered for Stage 2 at epoch {self.current_epoch}")
+            self.trainer.save_checkpoint('stage2_final_model.ckpt')
+            self.trainer.should_stop = True
+        self.log('stage2_wait', self.stage2_wait, batch_size=1)
+        self.log('stage2_best_loss', self.stage2_best_loss, batch_size=1)
+
+        for step_idx in range(self.generator_steps):
+            self.toggle_optimizer(optimizer_g)
+            optimizer_g.zero_grad()
+            retain_graph = step_idx < self.generator_steps - 1
+            self.manual_backward(generator_loss, retain_graph=retain_graph)
+            optimizer_g.step()
+            self.untoggle_optimizer(optimizer_g)
+
+        if d_loss is not None:
+            self.log('d_loss', d_loss, batch_size=1, prog_bar=True)
+        if g_adv_loss is not None:
+            self.log('g_adv_loss', g_adv_loss, batch_size=1, prog_bar=True)
+        self.log('stage2_loss', generator_loss, batch_size=1, prog_bar=True)
+
+        return generator_loss
+
+    def _discriminator_loss(self, real_samples, fake_samples):
+        real_logits = self.discriminator(real_samples)
+        fake_logits = self.discriminator(fake_samples)
+        loss_real = self.adv_loss_fn(real_logits, torch.ones_like(real_logits))
+        loss_fake = self.adv_loss_fn(fake_logits, torch.zeros_like(fake_logits))
+        return 0.5 * (loss_real + loss_fake)
+
+    def configure_optimizers(self):
+        generator_optimizer = torch.optim.Adam(self.imputer.parameters(), lr=self.hparams.lr)
+        discriminator_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=self.hparams.discriminator_lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            generator_optimizer, mode='min', factor=0.5, patience=10, verbose=True
+        )
+        return (
+            [generator_optimizer, discriminator_optimizer],
+            [{"scheduler": scheduler, "monitor": "stage1_loss"}],
+        )
+
+    def lr_scheduler_step(self, scheduler, optimizer_idx):
+        if optimizer_idx != 0:
+            return
+        monitor_metric = "stage1_loss" if not self.stage1_complete else "stage2_loss"
+        metric_value = self.trainer.callback_metrics.get(monitor_metric)
+        if metric_value is not None:
+            scheduler.step(metric_value)
+        else:
+            print(f"Warning: Metric '{monitor_metric}' not found. Skipping scheduler step.")
+            
+class TwoStageGNNImputer(L.LightningModule):
+    def __init__(self, num_features, n_matching_genes, hidden_channels=64, num_layers=3, 
+                 layer_type='ClusterGCN', dropout=0.3,
+                 gene_masking_percent=0.3, lr=5e-4, stage1_epochs=500, 
+                 similarity_weight=0.5, alignment_lr=5e-4, alignment_devices=None,
+                 stage2_patience=20, stage2_min_delta=1e-4,
+                 stage1_patience=10, stage1_min_delta=1e-4, lam_genegraph=0.1,
+                 discriminator_hidden=256, discriminator_lr=5e-4, adv_weight=0.05,
+                 discriminator_steps=1, generator_steps=1, alignment_matrix=None,
+                 triplet_margin=1.0, triplet_weight=0.1, stage1_only=False):
+        super().__init__()
+        self.save_hyperparameters(ignore=["alignment_matrix"])
+        if alignment_matrix is not None:
+            cpu_matrix = torch.as_tensor(alignment_matrix, dtype=torch.float32)
+            self.register_buffer("alignment_matrix_cpu", cpu_matrix, persistent=False)
+        else:
+            self.register_buffer("alignment_matrix_cpu", None, persistent=False)
+        
+        # Main imputation model
+        self.imputer = GNNImputer(num_features=num_features, n_matching_genes=n_matching_genes, hidden_channels=hidden_channels, 
+                                  num_layers=num_layers, layer_type=layer_type, dropout=dropout, learning_rate=lr)
+        
+        # Two-stage training parameters
+        self.stage1_epochs = stage1_epochs
+        self.similarity_weight = similarity_weight
+        self.gene_masking_percent = gene_masking_percent
+        self.alignment_lr = alignment_lr
+        self.alignment_devices = alignment_devices if alignment_devices is not None else [0]
+        self.current_epoch_stage = 0
+        self.stage1_only = stage1_only
+
+        # Early stopping parameters for stage 1
+        self.stage1_patience = stage1_patience
+        self.stage1_min_delta = stage1_min_delta
+        self.stage1_best_loss = float('inf')
+        self.stage1_wait = 0
+
+        # Early stopping parameters for stage 2
+        self.stage2_patience = stage2_patience
+        self.stage2_min_delta = stage2_min_delta
+        self.stage2_best_loss = float('inf')
+        self.stage2_wait = 0
+        self.stage2_stopped = False
+        
+        # For storing intermediate results
+        self.stage1_complete = False
+        self.sn_indices = None
+        self.st_indices = None
+        self.sn_sn_similarity = None
+        self.lam_genegraph = lam_genegraph
+        self.genegraph_loss = CosineLoss()  # Initialize the gene graph loss
+        self.sn_genegraph = None  # Cache for SN_genegraph
+        self.automatic_optimization = False
+        disc_in_features = max(1, int(self.hparams.n_matching_genes))
+        hidden_mid = max(1, discriminator_hidden // 2)
+        self.discriminator = nn.Sequential(
+            nn.Linear(disc_in_features, discriminator_hidden),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(discriminator_hidden, hidden_mid),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden_mid, 1)
+        )
+        self.adv_loss_fn = nn.BCEWithLogitsLoss()
+        self.generator_steps = generator_steps
+        self.discriminator_steps = discriminator_steps
+        self.triplet_loss_fn = nn.TripletMarginLoss(margin=triplet_margin)
+        self.triplet_weight = triplet_weight
+
+    def setup_indices(self, sn_size, st_size):
+        """Setup indices for SN and ST data"""
+        sn_size = int(sn_size)
+        st_size = int(st_size)
+        if sn_size <= 0 or st_size <= 0:
+            raise ValueError("sn_size and st_size must be positive integers.")
+        self.sn_indices = torch.arange(sn_size)
+        self.st_indices = torch.arange(sn_size, sn_size + st_size)
+        
+    def forward(self, x, edge_index):
+        return self.imputer(x, edge_index)
+    
+    def compute_alignment_matrices(self, sn_data, st_data):
+        """Compute alignment matrices using scGALA's get_alignments function"""
+        from .main import get_alignments
+        
+        # Create temporary AnnData objects
+        sn_adata = ad.AnnData(X=sn_data.detach().cpu().numpy())
+        st_adata = ad.AnnData(X=st_data.detach().cpu().numpy())
+        
+        # Get alignment matrix using scGALA
+        alignment_matrix = get_alignments(
+            adata1=sn_adata, 
+            adata2=st_adata,
+            k=20,
+            min_value=0.8, 
+            lr=self.alignment_lr,
+            max_epochs=10,  # Fewer epochs for efficiency
+            get_edge_probs=True,
+            scale=True,
+            devices=self.alignment_devices,
+            default_root_dir='./logs/scgala_alignment',
+        )
+
+        # Add explicit GPU memory cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Clean up temporary AnnData objects
+        del sn_adata, st_adata
+        gc.collect()
+        
+        print('Alignment matrix computed at epoch:', self.current_epoch_stage)
+        return torch.tensor(alignment_matrix, device=self.device, dtype=torch.float32)
+    
+    def compute_similarity_matrices(self, data, k=20, sparse=True):
+        """Compute sparse pairwise similarity matrices using cosine similarity with K-NN, preserving gradients."""
+        # Normalize data
+        data_norm = F.normalize(data, p=2, dim=1)
+        
+        # Compute full cosine similarity for finding K-NN
+        full_similarity = torch.mm(data_norm, data_norm.t())
+        
+        if sparse:
+            # Find top-k similarities for each node (including self)
+            topk_values, topk_indices = torch.topk(full_similarity, k=k+1, dim=1, largest=True)
+
+            # Create a mask for the K-NN values
+            n_nodes = data.size(0)
+            mask = torch.zeros_like(full_similarity, dtype=torch.bool)
+            mask.scatter_(1, topk_indices, True)
+
+            # Use the mask to keep only K-NN similarities, set others to zero (preserves gradient)
+            similarity = torch.where(mask, full_similarity, torch.zeros_like(full_similarity))
+        else:
+            # Use full similarity matrix directly
+            similarity = full_similarity
+        # Make symmetric by taking max(sim[i,j], sim[j,i])
+        similarity = torch.max(similarity, similarity.t())
+        
+        return similarity
+    
+    def compute_similarity_loss(self, sn_data, st_data):
+        """Compute similarity preservation loss"""
+        # Get alignment probabilities between SN and ST
+        if not hasattr(self, 'st_sn_alignment_norm'):
+            sn_st_alignment = self.alignment_matrix_cpu.to(self.device, non_blocking=True)
+            st_sn_alignment = sn_st_alignment.t()
+            # Row-normalize alignment matrices (each row sums to 1)
+            self.st_sn_alignment_norm = F.normalize(st_sn_alignment, p=1, dim=1).detach().to(self.device)
+            self.sn_st_alignment_norm = F.normalize(sn_st_alignment, p=1, dim=1).detach().to(self.device)
+            del sn_st_alignment, st_sn_alignment, self.alignment_matrix_cpu  # Free memory
+
+        # Compute similarity matrices
+        if self.sn_sn_similarity is None:
+            sn_sim = self.compute_similarity_matrices(sn_data, sparse=True, k=20)
+            self.sn_sn_similarity_cpu = sn_sim.detach().cpu()
+            self.actual_norm_sn = F.normalize(
+                self.sn_sn_similarity_cpu.flatten().unsqueeze(0), p=2, dim=1
+            )
+        sn_sn_similarity = self.sn_sn_similarity_cpu.to(self.device, non_blocking=True)
+            
+        st_st_similarity = self.compute_similarity_matrices(st_data, sparse=False,k=20).to(self.device)
+        
+        # Expected ST-ST similarity based on SN-SN similarity and SN-ST alignment
+        # expected_st_st = ST-SN @ SN-SN @ SN-ST
+        
+        if not hasattr(self, 'expected_norm_st'):
+            expected_st = torch.mm(
+                torch.mm(self.st_sn_alignment_norm, sn_sn_similarity),
+                self.sn_st_alignment_norm
+            )
+            self.expected_norm_st = F.normalize(
+                expected_st.flatten().unsqueeze(0), p=2, dim=1
+            ).cpu()
+        expected_sn_sn_similarity = torch.mm(
+            torch.mm(self.sn_st_alignment_norm, st_st_similarity), 
+            self.st_sn_alignment_norm
+        )
+        
+        # Compute cosine similarity between expected and actual ST-ST similarities
+        
+        actual_flat_st = st_st_similarity.flatten()
+        expected_flat_sn = expected_sn_sn_similarity.flatten()
+        
+        # Normalize vectors
+        actual_norm_st = F.normalize(actual_flat_st.unsqueeze(0), p=2, dim=1)
+        expected_norm_sn = F.normalize(expected_flat_sn.unsqueeze(0), p=2, dim=1)
+        
+        expected_norm_st = self.expected_norm_st.to(self.device, non_blocking=True)
+        # Compute cosine similarity (we want to maximize this, so minimize 1 - similarity)
+        cosine_sim_st = F.cosine_similarity(expected_norm_st, actual_norm_st, dim=1)
+        similarity_loss_st = 1 - cosine_sim_st.mean()
+        cosine_sim_sn = F.cosine_similarity(expected_norm_sn, self.actual_norm_sn, dim=1)
+        similarity_loss_sn = 1 - cosine_sim_sn.mean()
+
+        return similarity_loss_st, similarity_loss_sn
+    
+    def compute_triplet_loss(self, embeddings, edge_index):
+        edge_index = edge_index.to(embeddings.device)
+        if edge_index.numel() == 0:
+            return embeddings.new_tensor(0.0)
+        anchors, positives = edge_index
+        mask = anchors != positives
+        anchors = anchors[mask]
+        positives = positives[mask]
+        if anchors.numel() == 0:
+            return embeddings.new_tensor(0.0)
+        direction_mask = anchors < positives
+        if direction_mask.any():
+            anchors = anchors[direction_mask]
+            positives = positives[direction_mask]
+        num_nodes = embeddings.size(0)
+        negatives = torch.randint(0, num_nodes, anchors.size(), device=embeddings.device)
+        neg_mask = (negatives == anchors) | (negatives == positives)
+        while neg_mask.any():
+            negatives[neg_mask] = torch.randint(0, num_nodes, (neg_mask.sum().item(),), device=embeddings.device)
+            neg_mask = (negatives == anchors) | (negatives == positives)
+        return self.triplet_loss_fn(
+            embeddings[anchors],
+            embeddings[positives],
+            embeddings[negatives],
+        )
+    
+    def training_step(self, batch, batch_idx):
+        # Early stopping check for stage 2
+        if self.stage2_stopped:
+            return None
+            
+        optimizer_g, optimizer_d = self.optimizers()
+
+        x_original, edge_index, bias = batch.x, batch.edge_index, batch.bias
+        mask = torch.rand_like(x_original) > self.gene_masking_percent
+        x = x_original * mask.to(x_original.device)
+
+        if self.sn_indices is None:
+            sn_size = bias
+            st_size = x.size(0) - bias
+            self.setup_indices(sn_size, st_size)
+
+        x_hat = self(x, edge_index)
+
+        loss_sn = F.mse_loss(x_hat[self.sn_indices], x[self.sn_indices])
+        loss_st = F.mse_loss(
+            x_hat[self.st_indices, :self.hparams.n_matching_genes],
+            x[self.st_indices, :self.hparams.n_matching_genes]
+        )
+        imputation_loss = loss_sn + loss_st
+        # base_total_loss = imputation_loss
+        triplet_loss = self.compute_triplet_loss(x_hat, edge_index)
+        base_total_loss = imputation_loss + self.triplet_weight * triplet_loss
+        self.log('triplet_loss', triplet_loss, batch_size=1, prog_bar=True)
+
+        similarity_loss_st = torch.tensor(0.0, device=x.device)
+        similarity_loss_sn = torch.tensor(0.0, device=x.device)
+        
+        if self.stage1_complete:
+            sn_data = x[self.sn_indices]
+            st_data = x_hat[self.st_indices]
+            similarity_loss_st, similarity_loss_sn = self.compute_similarity_loss(sn_data, st_data)
+            base_total_loss = base_total_loss + self.similarity_weight * (similarity_loss_st + similarity_loss_sn)
+            
+        if not self.stage1_complete:
+            stage1_metric = base_total_loss
+            if stage1_metric < self.stage1_best_loss - self.stage1_min_delta:
+                self.stage1_best_loss = stage1_metric.item()
+                self.stage1_wait = 0
+            else:
+                self.stage1_wait += 1
+            if self.stage1_wait >= self.stage1_patience or self.current_epoch >= self.stage1_epochs:
+                self.stage1_complete = True
+                print(f"Early stopping triggered for Stage 1 at epoch {self.current_epoch}")
+                print("Stage 1 completed early. Switching to Stage 2 with similarity regularization.")
+                self.trainer.save_checkpoint(f'stage1_early_stopped_model_{self.hparams.layer_type}.ckpt')
+                self.current_epoch_stage = self.stage1_epochs
+                if self.stage1_only:
+                    self.trainer.should_stop = True
+            self.log('stage1_loss', stage1_metric, batch_size=1, prog_bar=True)
+            self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
+            self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
+            self.log('stage1_wait', self.stage1_wait, batch_size=1)
+            self.log('stage1_best_loss', self.stage1_best_loss, batch_size=1)
+        else:
+            stage2_metric = base_total_loss
+            self.log('similarity_loss_st', similarity_loss_st, batch_size=1, prog_bar=True)
+            self.log('similarity_loss_sn', similarity_loss_sn, batch_size=1, prog_bar=True)
+
+            self.log('stage2_base_loss', stage2_metric, batch_size=1, prog_bar=True)
+            self.log('imputation_loss', imputation_loss, batch_size=1, prog_bar=True)
+            self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
+            self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
+
+        if self.sn_genegraph is None:
+            self.sn_genegraph = cross_dist(
+                x[self.sn_indices, :self.hparams.n_matching_genes],
+                x[self.sn_indices, self.hparams.n_matching_genes:]
+            )
+            self.sn_genegraph = self.sn_genegraph.detach()
+        st_genegraph = cross_dist(
+            x[self.st_indices, :self.hparams.n_matching_genes],
+            x_hat[self.st_indices, self.hparams.n_matching_genes:]
+        )
+        loss_genegraph = self.genegraph_loss(st_genegraph, self.sn_genegraph)
+        total_loss = base_total_loss + self.lam_genegraph * loss_genegraph
+        self.log('loss_genegraph', loss_genegraph, batch_size=1, prog_bar=True)
+
+        if not self.stage1_complete:
+            self.toggle_optimizer(optimizer_g)
+            optimizer_g.zero_grad()
+            self.manual_backward(total_loss)
+            optimizer_g.step()
+            self.untoggle_optimizer(optimizer_g)
+            return total_loss
+
+        if self.stage2_stopped:
+            self.log('stage2_loss', total_loss, batch_size=1, prog_bar=True)
+            return total_loss
+
+        real_st = x_original[self.st_indices, :self.hparams.n_matching_genes]
+        fake_st = x_hat[self.st_indices, :self.hparams.n_matching_genes]
+        # real_st = x_original[self.sn_indices, self.hparams.n_matching_genes:]
+        # fake_st = x_hat[self.st_indices,self.hparams.n_matching_genes:]
+        fake_detached = fake_st.detach()
+        d_loss = None
+        if real_st.numel() > 0:
+            real_detached = real_st.detach()
+            for step_idx in range(self.discriminator_steps):
+                self.toggle_optimizer(optimizer_d)
+                optimizer_d.zero_grad()
+                d_loss = self._discriminator_loss(real_detached, fake_detached)
+                self.manual_backward(d_loss)
+                optimizer_d.step()
+                self.untoggle_optimizer(optimizer_d)
+
+        generator_loss = total_loss
+        g_adv_loss = None
+        if real_st.numel() > 0:
+            fake_logits = self.discriminator(fake_st)
+            g_adv_loss = self.adv_loss_fn(fake_logits, torch.ones_like(fake_logits))
+            generator_loss = generator_loss + self.hparams.adv_weight * g_adv_loss
+        if generator_loss < self.stage2_best_loss - self.stage2_min_delta:
+            self.stage2_best_loss = generator_loss.item()
+            self.stage2_wait = 0
+        else:
+            self.stage2_wait += 1
+        if self.stage2_wait >= self.stage2_patience:
+            self.stage2_stopped = True
+            print(f"Early stopping triggered for Stage 2 at epoch {self.current_epoch}")
+            self.trainer.save_checkpoint(f'stage2_final_model_{self.hparams.layer_type}.ckpt')
+            self.trainer.should_stop = True
+       
+        self.log('stage2_wait', self.stage2_wait, batch_size=1)
+        self.log('stage2_best_loss', self.stage2_best_loss, batch_size=1)
 
         for step_idx in range(self.generator_steps):
             self.toggle_optimizer(optimizer_g)

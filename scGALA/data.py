@@ -351,7 +351,7 @@ class TwoStageDataModule(L.LightningDataModule):
                  mnn1=None, mnn2=None, batch_size=1,
                  sn_inter_edges_path=None, st_inter_edges_path=None,
                  sn_centroid=None, st_centroid=None, devices=[0], force_recompute=False,
-                 patient_key='patient', centroid_method='pca',use_scGALA=True,verbose=False):
+                 patient_key='patient', centroid_method='pca',use_scGALA=True,verbose=False, save_alignment_matrix=False,num_workers=8):
         super().__init__()
         self.batch_size = batch_size
         sc.pp.pca(adata_sn)
@@ -361,6 +361,7 @@ class TwoStageDataModule(L.LightningDataModule):
         self.k = k
         self.devices = devices
         self.force_recompute = force_recompute
+        self.num_workers = num_workers
 
         # Prepare gene order as before
         start_time = time.time()
@@ -393,7 +394,7 @@ class TwoStageDataModule(L.LightningDataModule):
         sn_edges = []
         for p in sn_patients:
             idx = reordered_adata_sn.obs[patient_key] == p
-            if idx.sum() <= 200:
+            if idx.sum() <= 20:
                 continue
             X = reordered_adata_sn.obsm['X_pca'][idx]
             local_indices = np.where(idx)[0]
@@ -447,17 +448,22 @@ class TwoStageDataModule(L.LightningDataModule):
                 min_value=0.9,
                 lamb=0.8,
                 devices=[1],
+                get_edge_probs=save_alignment_matrix,
+                get_matrix=True,
                 lr=1e-3,
                 replace=True,
                 min_epochs=20,
                 scale=True
             )
+            if save_alignment_matrix:
+                alignments_matrix, alignment_matrix = alignments_matrix
+                np.save('alignment_matrix_two_stage.npy', alignment_matrix)
             mnn1 , mnn2 = alignments_matrix.nonzero()
         if isinstance(mnn1[0], str):
             mnn1 = reordered_adata_sn.obs_names.get_indexer(mnn1)
         if isinstance(mnn2[0], str):
             mnn2 = adata_st_common.obs_names.get_indexer(mnn2)
-        mnn_edges = np.stack([mnn1, mnn2 + bias], axis=0)
+        mnn_edges = np.stack([np.array(mnn1), np.array(mnn2) + bias], axis=0)
         # Final edge_index
         edge_index = np.concatenate([sn_all_edges, st_all_edges_offset, mnn_edges], axis=1)
         edge_index = to_undirected(torch.from_numpy(edge_index)).to(torch.int64)
@@ -481,12 +487,14 @@ class TwoStageDataModule(L.LightningDataModule):
                 f.write(f'{n_matching_genes}\n')
                 for var_name in reordered_adata_sn.var_names:
                     f.write(f'{var_name}\n')
+            mnn_combined = np.column_stack((mnn1, mnn2))
+            np.savetxt('mnn_combined.csv', mnn_combined, delimiter=',', fmt='%d')
 
     def setup(self, stage=None):
         self.data = pyg_data.Data(x=self.x, edge_index=self.edge_index, bias=self.bias)
 
     def train_dataloader(self):
-        return pyg_data.DataLoader([self.data], batch_size=self.batch_size, shuffle=False)
+        return pyg_data.DataLoader([self.data], batch_size=self.batch_size, shuffle=False,num_workers=self.num_workers)
 
     def val_dataloader(self):
-        return pyg_data.DataLoader([self.data], batch_size=self.batch_size, shuffle=False)
+        return pyg_data.DataLoader([self.data], batch_size=self.batch_size, shuffle=False,num_workers=self.num_workers)
