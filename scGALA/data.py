@@ -447,7 +447,7 @@ class TwoStageDataModule(L.LightningDataModule):
                 adata2=adata_st_common,
                 min_value=0.9,
                 lamb=align_lamb,
-                devices=[1],
+                devices=self.devices,
                 get_edge_probs=save_alignment_matrix,
                 get_matrix=True,
                 lr=1e-3,

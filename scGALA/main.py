@@ -510,7 +510,7 @@ def two_stage_spatial_imputation(
         st_inter_edges_path=st_inter_edges_path,
         sn_centroid=sn_centroid,
         st_centroid=st_centroid,
-        devices=devices,
+        devices=alignment_devices,
         force_recompute=force_recompute,
         patient_key=patient_key,
         centroid_method=centroid_method,
