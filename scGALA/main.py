@@ -403,7 +403,7 @@ def two_stage_spatial_imputation(
     sn_centroid=None, st_centroid=None, force_recompute=False,
     patient_key='patient', centroid_method='pca',use_scGALA=True,lam_genegraph=0.1,
     adv_weight=0.05, discriminator_hidden=256, discriminator_lr=1e-3,
-    discriminator_steps=1, generator_steps=1,num_workers=8,return_stage_1 = False,stage1_only=False, mixed_precision = False
+    discriminator_steps=1, generator_steps=1,num_workers=8,return_stage_1 = False,stage1_only=False, mixed_precision = False, align_lamb = 0.8
 ):
     """
     Two-stage spatial transcriptomics imputation with similarity preservation
@@ -475,6 +475,8 @@ def two_stage_spatial_imputation(
         Number of discriminator updates per optimization round.
     generator_steps : int, default 1
         Number of generator updates per optimization round.
+    align_lamb : float, default 0.8
+        hyperparameter for scGALA alignment.
     
     Returns
     -------
@@ -514,7 +516,8 @@ def two_stage_spatial_imputation(
         centroid_method=centroid_method,
         use_scGALA=use_scGALA,
         save_alignment_matrix=save_alignment_matrix,
-        num_workers=num_workers
+        num_workers=num_workers,
+        align_lamb=align_lamb
     )
     if alignment_matrix is None:
         alignment_matrix = np.load('alignment_matrix_two_stage.npy')

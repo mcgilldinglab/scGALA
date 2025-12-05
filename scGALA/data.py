@@ -351,7 +351,7 @@ class TwoStageDataModule(L.LightningDataModule):
                  mnn1=None, mnn2=None, batch_size=1,
                  sn_inter_edges_path=None, st_inter_edges_path=None,
                  sn_centroid=None, st_centroid=None, devices=[0], force_recompute=False,
-                 patient_key='patient', centroid_method='pca',use_scGALA=True,verbose=False, save_alignment_matrix=False,num_workers=8):
+                 patient_key='patient', centroid_method='pca',use_scGALA=True,verbose=False, save_alignment_matrix=False,num_workers=8, align_lamb=0.8):
         super().__init__()
         self.batch_size = batch_size
         sc.pp.pca(adata_sn)
@@ -446,7 +446,7 @@ class TwoStageDataModule(L.LightningDataModule):
                 adata1=reordered_adata_sn[:, adata_st_common.var_names],
                 adata2=adata_st_common,
                 min_value=0.9,
-                lamb=0.8,
+                lamb=align_lamb,
                 devices=[1],
                 get_edge_probs=save_alignment_matrix,
                 get_matrix=True,

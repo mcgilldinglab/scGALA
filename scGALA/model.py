@@ -1370,7 +1370,7 @@ class TwoStageGNNImputer(L.LightningModule):
             )
             self.sn_genegraph = self.sn_genegraph.detach()
         st_genegraph = cross_dist(
-            x[self.st_indices, :self.hparams.n_matching_genes],
+            x_hat[self.st_indices, :self.hparams.n_matching_genes],
             x_hat[self.st_indices, self.hparams.n_matching_genes:]
         )
         loss_genegraph = self.genegraph_loss(st_genegraph, self.sn_genegraph)
