@@ -1303,8 +1303,9 @@ class TwoStageGNNImputer(L.LightningModule):
         optimizer_g, optimizer_d = self.optimizers()
 
         x_original, edge_index, bias = batch.x, batch.edge_index, batch.bias
-        mask = torch.rand_like(x_original) > self.gene_masking_percent
-        x = x_original * mask.to(x_original.device)
+        mask = torch.rand_like(x_original[:, self.hparams.n_matching_genes:]) > self.gene_masking_percent
+        x = x_original.clone()
+        x[:, self.hparams.n_matching_genes:] = x[:, self.hparams.n_matching_genes:] * mask.to(x.device)
 
         if self.sn_indices is None:
             sn_size = bias
@@ -1313,10 +1314,10 @@ class TwoStageGNNImputer(L.LightningModule):
 
         x_hat = self(x, edge_index)
 
-        loss_sn = F.mse_loss(x_hat[self.sn_indices], x[self.sn_indices])
+        loss_sn = F.mse_loss(x_hat[self.sn_indices], x_original[self.sn_indices])
         loss_st = F.mse_loss(
             x_hat[self.st_indices, :self.hparams.n_matching_genes],
-            x[self.st_indices, :self.hparams.n_matching_genes]
+            x_original[self.st_indices, :self.hparams.n_matching_genes]
         )
         imputation_loss = loss_sn + loss_st
         # base_total_loss = imputation_loss
@@ -1330,7 +1331,7 @@ class TwoStageGNNImputer(L.LightningModule):
         similarity_loss_sn = torch.tensor(0.0, device=x.device)
         
         if self.stage1_complete and self.similarity_weight > 0:
-            sn_data = x[self.sn_indices]
+            sn_data = x_original[self.sn_indices]
             st_data = x_hat[self.st_indices]
             similarity_loss_st, similarity_loss_sn = self.compute_similarity_loss(sn_data, st_data)
             base_total_loss = base_total_loss + self.similarity_weight * (similarity_loss_st + similarity_loss_sn)
@@ -1365,12 +1366,12 @@ class TwoStageGNNImputer(L.LightningModule):
             self.log('loss_sn', loss_sn, batch_size=1, prog_bar=True)
             self.log('loss_st', loss_st, batch_size=1, prog_bar=True)
 
-        loss_genegraph = torch.tensor(0.0, device=x.device)
+        loss_genegraph = torch.tensor(0.0, device=x_original.device)
         if self.lam_genegraph > 0:
             if self.sn_genegraph is None:
                 self.sn_genegraph = cross_dist(
-                    x[self.sn_indices, :self.hparams.n_matching_genes],
-                    x[self.sn_indices, self.hparams.n_matching_genes:]
+                    x_original[self.sn_indices, :self.hparams.n_matching_genes],
+                    x_original[self.sn_indices, self.hparams.n_matching_genes:]
                 )
                 self.sn_genegraph = self.sn_genegraph.detach()
             st_genegraph = cross_dist(
@@ -1410,7 +1411,7 @@ class TwoStageGNNImputer(L.LightningModule):
                 self.untoggle_optimizer(optimizer_d)
 
         generator_loss = total_loss
-        g_adv_loss = torch.tensor(0.0, device=x.device)
+        g_adv_loss = torch.tensor(0.0, device=x_original.device)
         if real_st.numel() > 0 and self.hparams.adv_weight > 0:
             fake_logits = self.discriminator(fake_st)
             g_adv_loss = self.adv_loss_fn(fake_logits, torch.ones_like(fake_logits))
