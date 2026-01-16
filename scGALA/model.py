@@ -1382,18 +1382,7 @@ class TwoStageGNNImputer(L.LightningModule):
         total_loss = base_total_loss + self.lam_genegraph * loss_genegraph
         self.log('loss_genegraph', loss_genegraph, batch_size=1, prog_bar=True)
 
-        if not self.stage1_complete:
-            self.toggle_optimizer(optimizer_g)
-            optimizer_g.zero_grad()
-            self.manual_backward(total_loss)
-            optimizer_g.step()
-            self.untoggle_optimizer(optimizer_g)
-            return total_loss
-
-        if self.stage2_stopped:
-            self.log('stage2_loss', total_loss, batch_size=1, prog_bar=True)
-            return total_loss
-
+        # GAN training now active in both stages
         real_st = x_original[self.st_indices, :self.hparams.n_matching_genes]
         fake_st = x_hat[self.st_indices, :self.hparams.n_matching_genes]
         # real_st = x_original[self.sn_indices, self.hparams.n_matching_genes:]
@@ -1416,6 +1405,23 @@ class TwoStageGNNImputer(L.LightningModule):
             fake_logits = self.discriminator(fake_st)
             g_adv_loss = self.adv_loss_fn(fake_logits, torch.ones_like(fake_logits))
             generator_loss = generator_loss + self.hparams.adv_weight * g_adv_loss
+        
+        if not self.stage1_complete:
+            self.toggle_optimizer(optimizer_g)
+            optimizer_g.zero_grad()
+            self.manual_backward(generator_loss)
+            optimizer_g.step()
+            self.untoggle_optimizer(optimizer_g)
+            if d_loss is not None:
+                self.log('d_loss', d_loss, batch_size=1, prog_bar=True)
+            if g_adv_loss is not None:
+                self.log('g_adv_loss', g_adv_loss, batch_size=1, prog_bar=True)
+            return generator_loss
+
+        if self.stage2_stopped:
+            self.log('stage2_loss', generator_loss, batch_size=1, prog_bar=True)
+            return generator_loss
+
         if generator_loss < self.stage2_best_loss - self.stage2_min_delta:
             self.stage2_best_loss = generator_loss.item()
             self.stage2_wait = 0

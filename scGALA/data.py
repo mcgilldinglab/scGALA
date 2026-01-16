@@ -311,7 +311,7 @@ def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patien
             edge_dict = pickle.load(f)
         print(f"Loaded inter-sample edges from {save_path}")
         return edge_dict
-    
+    print("Constructing inter-sample edges...")
     patients = adata.obs[patient_key].unique()
     if centroid_patient is None:
         centroid_patient = select_centroid_patient(adata, method=centroid_method, patient_key=patient_key)
@@ -442,6 +442,7 @@ class TwoStageDataModule(L.LightningDataModule):
         # MNN edges (if provided)
         if mnn1 is None or mnn2 is None:
             from .main import get_alignments
+            #TODO: here we need to run scGALA on pairs of datasets that have the same patient key, and since they may not be sequential, we need to map the alignment matrix and mnn1,mnn2 accordingly to form the final alignment matrix and alignments.
             alignments_matrix = get_alignments(
                 adata1=reordered_adata_sn[:, adata_st_common.var_names],
                 adata2=adata_st_common,

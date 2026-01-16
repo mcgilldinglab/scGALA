@@ -497,7 +497,7 @@ def two_stage_spatial_imputation(
     else:
         save_alignment_matrix=False
     
-    precision = '16-mixed' if mixed_precision else "32"
+    precision = 'bf16-mixed' if mixed_precision else "32"
         
     # Prepare data
     data_module = TwoStageDataModule(
