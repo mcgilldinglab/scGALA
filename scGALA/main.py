@@ -11,7 +11,7 @@ from lightning.pytorch.callbacks import EarlyStopping,ModelSummary,ModelCheckpoi
 from lightning.pytorch.profilers import AdvancedProfiler
 from typing import Literal
 import pandas as pd
-from .utils import make_alignments,find_mutual_nn
+from .utils import make_alignments,find_mutual_nn,make_alignments_v2
 import torch
 import numpy as np
 import scipy.sparse as sp
@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore', '.*deprecated.*')
 torch.set_float32_matmul_precision('medium')
 EPS = 1e-15
 
-def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20, min_value=0.9, default_root_dir=None,max_epochs:int = 30,lamb = 0.3,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',get_latent:bool = False, get_edge_probs:bool = False, get_matrix:bool = True,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False, masking_ratio=0.3,inter_edge_mask_weight:float = 0.5, verbose:bool=True):
+def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20, min_value=0.9, default_root_dir=None,max_epochs:int = 30,lamb = 0.3,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',get_latent:bool = False, get_edge_probs:bool = False, get_matrix:bool = True, alignment_version:Literal['v1','v2'] = 'v2',alignment_lr=1e-3,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False, masking_ratio=0.3,inter_edge_mask_weight:float = 0.5, verbose:bool=True):
     '''
     To get the alignments as a matrix showing the possibility of their alignment and the unaligned pairs are set to zero.
     Provide either the dir of adata with data_dirs or directly provide adatas.
@@ -224,7 +224,10 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         likelyhood[likelyhood < min_value] = 0
     # make alignment through score-based greedy algorithm
     if get_matrix:
-        alignments_matrix = make_alignments(latent=latent,mnn1=mnn1,mnn2=mnn2,bias=bias,lamb=lamb,min_value=min_value,replace=replace)
+        if alignment_version=='v1':
+            alignments_matrix = make_alignments(latent=latent,mnn1=mnn1,mnn2=mnn2,bias=bias,lamb=lamb,min_value=min_value,replace=replace)
+        elif alignment_version=='v2':
+            alignments_matrix = make_alignments_v2(latent=latent,mnn1=mnn1,mnn2=mnn2,bias=bias,lamb=lamb,min_value=min_value,replace=replace,lr=alignment_lr,devices=devices)
         print(f'R:{data1.shape[0]} D:{data2.shape[0]}')
     
     if get_matrix and not get_edge_probs:

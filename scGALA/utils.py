@@ -421,6 +421,119 @@ def make_alignments(latent: torch.Tensor, mnn1: list, mnn2: list, bias: int, lam
             marriage_choices[i, j] = 1
     
     return marriage_choices
+
+import torch
+import torch.optim as optim
+import lightning as L
+from lightning.pytorch.callbacks import EarlyStopping
+
+class BinaryAlignmentOptimizer(L.LightningModule):
+    def __init__(self, A, lambda_val=0.3, lr=0.1):
+        super().__init__()
+        # A is a fixed constant for this optimization problem
+        self.register_buffer('A', A, persistent=False)
+        self.lambda_val = lambda_val
+        self.lr = lr
+        
+        # Initialize learnable logits
+        self.logits = torch.nn.Parameter(torch.empty_like(self.A).copy_(self.A), requires_grad=True)
+        
+        # # To track the "loss" (negative objective) manually
+        # self.save_hyperparameters()
+
+    def forward(self):
+        # Straight-Through Estimator (STE)
+        probs = torch.sigmoid(self.logits)
+        P_binary = (probs > 0.5).float()
+        # STE trick: P is binary, but gradients flow to probs
+        P = P_binary - probs.detach() + probs
+        return P
+
+    def training_step(self, batch, batch_idx):
+        P = self.forward()
+        
+        # Term 1: Alignment Reward
+        score_term = torch.sum(P * self.A)
+        
+        # Term 2: Over-alignment Penalty
+        row_penalty = torch.sum(torch.sum(P, dim=1)**2)
+        col_penalty = torch.sum(torch.sum(P, dim=0)**2)
+        penalty_term = row_penalty + col_penalty
+        
+        # Objective = Reward - Penalty
+        objective = score_term - self.lambda_val * penalty_term
+        loss = -objective
+
+        
+        N_links = P.sum()
+        # Log metrics
+        self.log('train_loss', loss, prog_bar=True)
+        self.log('alignment_score', score_term, prog_bar=True)
+        self.log('active_links', N_links, prog_bar=True)
+
+        
+        return loss
+
+    def configure_optimizers(self):
+        return optim.Adam([self.logits], lr=self.lr)
+
+
+def make_alignments_v2(latent: torch.Tensor, mnn1: list, mnn2: list, bias: int, lamb: float, min_value: float = 0, replace=False, devices = None, lr=0.1):
+    likelyhood = torch.matmul(latent[:bias], latent[bias:].T).sigmoid()
+    likelyhood = likelyhood.detach()
+    happiness_scores = torch.where(likelyhood >= min_value, likelyhood, 0)
+    happiness_scores.requires_grad = False
+    device = torch.device(f"cuda:{devices[0]}" if torch.cuda.is_available() and devices is not None else "cpu")
+
+    # Create model
+    model = BinaryAlignmentOptimizer(A=happiness_scores.to(device), lambda_val=lamb, lr=lr)
+
+    # We use a dummy DataLoader because we are optimizing a single matrix, 
+    # not iterating over a dataset.
+    from torch.utils.data import DataLoader, Dataset
+    class DummyDataset(Dataset):
+        def __len__(self): return 100 # Optimization iterations
+        def __getitem__(self, idx): return torch.tensor(0)
+
+    # Train the model
+    early_stop_callback = EarlyStopping(
+        monitor="train_loss",   # Metric to monitor
+        min_delta=0.001,        # Minimum change to qualify as an improvement
+        patience=10,            # Number of checks with no improvement after which training will be stopped
+        verbose=True,
+        mode="min"              # We want to minimize the negative objective
+    )
+    # from lightning.pytorch.profilers import AdvancedProfiler
+    # profiler = AdvancedProfiler(dirpath=".", filename="perf_logs")
+    trainer = L.Trainer(
+        num_sanity_val_steps=0,  # This skips the pre-train pause
+        max_epochs=1000, 
+        enable_checkpointing=False,
+        callbacks=[early_stop_callback],
+        accelerator="auto", 
+        devices=devices
+    )
+    trainer.fit(model, DataLoader(DummyDataset(), batch_size=1))
+
+    # Get final binary matrix
+    final_P = (torch.sigmoid(model.logits) > 0.5).float()
+    marriage_choices = final_P.detach().cpu().numpy()
+    aligned_R = np.count_nonzero(marriage_choices,axis=1)
+    aligned_C = np.count_nonzero(marriage_choices,axis=0)
+    aligned_R_count = np.count_nonzero(aligned_R)
+    aligned_C_count = np.count_nonzero(aligned_C)
+    N_links = marriage_choices.sum()
+    
+    print(f"Aligned rows: {aligned_R_count}, Aligned cols: {aligned_C_count}", 'Max aligned rows:', np.max(aligned_R), 'Max aligned cols:', np.max(aligned_C), 'Mean aligned rows:', N_links / (aligned_R_count + 1), 'Mean aligned cols:', N_links / (aligned_C_count + 1))
+    
+    # Add MNN pairs
+    if not replace:
+        for i, j in zip(mnn1, mnn2):
+            marriage_choices[i, j] = 1
+    
+    return marriage_choices
+
+    
 # # for scDML
 
 # from annoy import AnnoyIndex
