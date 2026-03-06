@@ -5,11 +5,12 @@ import torch_geometric.data as pyg_data
 from .utils import get_graph
 import lightning as L
 import scanpy as sc
+from typing import Literal
 
 class FullBatchDataset(Dataset):
-    def __init__(self,adata1:AnnData,adata2:AnnData,mnn1,mnn2,length,spatial=False):
+    def __init__(self,adata1:AnnData,adata2:AnnData,mnn1,mnn2,length,spatial=False,verbose=True):
         super().__init__()
-        self.data = get_graph(data1=adata1,data2=adata2,mnn1=mnn1,mnn2=mnn2,spatial=spatial)
+        self.data = get_graph(data1=adata1,data2=adata2,mnn1=mnn1,mnn2=mnn2,spatial=spatial,timeit=verbose)
         self.length = length
         self.spatial = spatial
 
@@ -20,10 +21,10 @@ class FullBatchDataset(Dataset):
         return self.length
 
 class MyDataModule(L.LightningDataModule):
-    def __init__(self, adata1:AnnData,adata2:AnnData,mnn1,mnn2,spatial=False):
+    def __init__(self, adata1:AnnData,adata2:AnnData,mnn1,mnn2,spatial=False,verbose=True):
         super().__init__()
-        self.train_dataset = FullBatchDataset(adata1,adata2,mnn1,mnn2,length=20,spatial=spatial)
-        self.val_dataset = FullBatchDataset(adata1,adata2,mnn1,mnn2,length=1,spatial=spatial)
+        self.train_dataset = FullBatchDataset(adata1,adata2,mnn1,mnn2,length=20,spatial=spatial,verbose=verbose)
+        self.val_dataset = FullBatchDataset(adata1,adata2,mnn1,mnn2,length=1,spatial=spatial,verbose=verbose)
         self.spatial = spatial
     def setup(self, stage):
         # make assignments here (val/train/test split)
@@ -106,6 +107,7 @@ class DataProcessor:
 from torch_geometric.utils import to_undirected
 from sklearn.neighbors import kneighbors_graph
 import time
+import scipy.sparse as sp
 
 def reorder_adata_genes(adata, target_adata,genes=None,n_matching_genes=None):
     """
@@ -300,7 +302,7 @@ def select_centroid_patient(adata, method='pca', patient_key='patient'):
     centroid_patient = valid_patients[np.argmin(dists)]
     return centroid_patient
 
-def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patient=None, devices=[0], force_recompute=False, patient_key='patient', centroid_method='pca',spatial=False,use_scGALA=True,verbose=False):
+def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patient=None, devices=[0], force_recompute=False, patient_key='patient', centroid_method='pca',spatial=False,use_scGALA=True,verbose=False,align_min_value=0.8,align_lamb=0.2,align_layer_type:Literal['GAT', 'GATv2', 'SAGE', 'ClusterGCN'] = 'GAT'):
     """
     Construct inter-sample edges using scGALA between all patients and the centroid patient.
     Save as a dict: {patient: edge_index (2, N_edges)}.
@@ -328,7 +330,8 @@ def construct_and_save_intersample_edges(adata, save_path, k=20, centroid_patien
         if adata_other.shape[0] <= 200:
             continue
         align_matrix = get_alignments(
-            adata1=adata_other, adata2=adata_centroid, k=k, min_value=0.9, lamb=0.3, devices=devices,
+            adata1=adata_other, adata2=adata_centroid, k=k, min_value=align_min_value, lamb=align_lamb,layer_type=align_layer_type,
+            devices=devices,
             get_matrix=True, scale=True,spatial=spatial,only_mnn=only_mnn,verbose=verbose
         )
         src, tgt = align_matrix.nonzero()
@@ -351,9 +354,11 @@ class TwoStageDataModule(L.LightningDataModule):
                  mnn1=None, mnn2=None, batch_size=1,
                  sn_inter_edges_path=None, st_inter_edges_path=None,
                  sn_centroid=None, st_centroid=None, devices=[0], force_recompute=False,
-                 patient_key='patient', centroid_method='pca',use_scGALA=True,verbose=False, save_alignment_matrix=False,num_workers=8, align_lamb=0.8):
+                 patient_key='patient', centroid_method='pca',use_scGALA=True,verbose=False, save_alignment_matrix=False,num_workers=8, align_lamb=0.2,align_min_value=0.8,align_layer_type:Literal['GAT', 'GATv2', 'SAGE', 'ClusterGCN'] = 'GAT'):
         super().__init__()
         self.batch_size = batch_size
+        if 'spatial' not in adata_st.obsm:
+            print("adata_st does not have spatial coordinates, using PCA instead.")
         sc.pp.pca(adata_sn)
         sc.pp.pca(adata_st)
         self.adata_sn = adata_sn
@@ -362,6 +367,18 @@ class TwoStageDataModule(L.LightningDataModule):
         self.devices = devices
         self.force_recompute = force_recompute
         self.num_workers = num_workers
+
+        # --- Fallback logic for patient_key ---
+        sn_has_patient_key = patient_key in adata_sn.obs
+        st_has_patient_key = patient_key in adata_st.obs
+        
+        if not sn_has_patient_key:
+            adata_sn.obs[patient_key] = 'default_sn_patient'
+            print(f"Warning: SN data does not have '{patient_key}' column. Creating default patient key.")
+        
+        if not st_has_patient_key:
+            adata_st.obs[patient_key] = 'default_st_patient'
+            print(f"Warning: ST data does not have '{patient_key}' column. Creating default patient key.")
 
         # Prepare gene order as before
         start_time = time.time()
@@ -376,18 +393,33 @@ class TwoStageDataModule(L.LightningDataModule):
         # --- Inter-sample edges for SN ---
         if sn_inter_edges_path is None:
             sn_inter_edges_path = './sn_inter_edges.pkl'
-        sn_inter_edges = construct_and_save_intersample_edges(
-            reordered_adata_sn, sn_inter_edges_path, k=k, centroid_patient=sn_centroid, devices=devices,
-            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method,spatial=False,use_scGALA=use_scGALA,verbose=verbose
-        )
+        
+        # Only construct inter-sample edges if SN has multiple patients
+        sn_patients = reordered_adata_sn.obs[patient_key].unique()
+        if len(sn_patients) > 1 and sn_has_patient_key:
+            sn_inter_edges = construct_and_save_intersample_edges(
+                reordered_adata_sn, sn_inter_edges_path, k=k, centroid_patient=sn_centroid, devices=devices,
+                force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method,spatial=False,use_scGALA=use_scGALA,verbose=verbose,align_min_value=align_min_value,align_lamb=align_lamb,
+                align_layer_type=align_layer_type
+            )
+        else:
+            print(f"Skipping inter-sample edge construction for SN: has_patient_key={sn_has_patient_key}, num_patients={len(sn_patients)}")
+            sn_inter_edges = {}
 
         # --- Inter-sample edges for ST ---
         if st_inter_edges_path is None:
             st_inter_edges_path = './st_inter_edges.pkl'
-        st_inter_edges = construct_and_save_intersample_edges(
-            adata_st_common, st_inter_edges_path, k=k, centroid_patient=st_centroid, devices=devices,
-            force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method, spatial=True,use_scGALA=use_scGALA,verbose=verbose
-        )
+        
+        # Only construct inter-sample edges if ST has multiple patients
+        st_patients = adata_st_common.obs[patient_key].unique()
+        if len(st_patients) > 1 and st_has_patient_key:
+            st_inter_edges = construct_and_save_intersample_edges(
+                adata_st_common, st_inter_edges_path, k=k, centroid_patient=st_centroid, devices=devices,
+                force_recompute=force_recompute, patient_key=patient_key, centroid_method=centroid_method, spatial=True,use_scGALA=use_scGALA,verbose=verbose,align_min_value=align_min_value,align_lamb=align_lamb,align_layer_type=align_layer_type
+            )
+        else:
+            print(f"Skipping inter-sample edge construction for ST: has_patient_key={st_has_patient_key}, num_patients={len(st_patients)}")
+            st_inter_edges = {}
 
         # --- Intra-sample edges ---
         sn_patients = reordered_adata_sn.obs[patient_key].unique()
@@ -411,7 +443,8 @@ class TwoStageDataModule(L.LightningDataModule):
                 continue
             X = adata_st_common.obsm['X_pca'][idx]
             local_indices = np.where(idx)[0]
-            knn = kneighbors_graph(X, k, mode='distance').tocoo()
+            k_st = k if 'spatial' not in adata_st_common.obsm else int(k/2)
+            knn = kneighbors_graph(X, k_st, mode='distance').tocoo()
             st_edges.append(np.stack([local_indices[knn.row], local_indices[knn.col]], axis=0))
             if 'spatial' in adata_st_common.obsm:
                 spatial_X = adata_st_common.obsm['spatial'][idx]
@@ -423,12 +456,12 @@ class TwoStageDataModule(L.LightningDataModule):
         # --- Combine all edges ---
         # SN intra + SN inter
         sn_all_edges = sn_edges
-        if sn_inter_edges is not None:
+        if sn_inter_edges is not None and len(sn_inter_edges) > 0:
             for arr in sn_inter_edges.values():
                 sn_all_edges = np.concatenate([sn_all_edges, arr], axis=1)
         # ST intra + ST inter + spatial
         st_all_edges = st_edges
-        if st_inter_edges is not None:
+        if st_inter_edges is not None and len(st_inter_edges) > 0:
             for arr in st_inter_edges.values():
                 st_all_edges = np.concatenate([st_all_edges, arr], axis=1)
         if st_spatial_edges.shape[1] > 0:
@@ -442,23 +475,134 @@ class TwoStageDataModule(L.LightningDataModule):
         # MNN edges (if provided)
         if mnn1 is None or mnn2 is None:
             from .main import get_alignments
-            #TODO: here we need to run scGALA on pairs of datasets that have the same patient key, and since they may not be sequential, we need to map the alignment matrix and mnn1,mnn2 accordingly to form the final alignment matrix and alignments.
-            alignments_matrix = get_alignments(
-                adata1=reordered_adata_sn[:, adata_st_common.var_names],
-                adata2=adata_st_common,
-                min_value=0.9,
-                lamb=align_lamb,
-                devices=self.devices,
-                get_edge_probs=save_alignment_matrix,
-                get_matrix=True,
-                lr=1e-3,
-                replace=True,
-                min_epochs=20,
-                scale=True
-            )
-            if save_alignment_matrix:
-                alignments_matrix, alignment_matrix = alignments_matrix
-                np.save('alignment_matrix_two_stage.npy', alignment_matrix)
+            import scipy.sparse as sp
+            
+            # Check if either dataset lacks the original patient key
+            # If so, do global alignment on the entire datasets as a single unit
+            if not sn_has_patient_key or not st_has_patient_key:
+                print("At least one dataset lacks original patient key. Running global alignment on entire datasets.")
+                global_alignment = True
+            else:
+                # Run alignment per patient to ensure we only align cells from the same patient
+                sn_patients = reordered_adata_sn.obs[patient_key].unique()
+                st_patients = adata_st_common.obs[patient_key].unique()
+                common_patients = list(set(sn_patients) & set(st_patients))
+                
+                if len(common_patients) == 0:
+                    print(f"Warning: No common patients found. Patients in SN: {sn_patients}, Patients in ST: {st_patients}, running global alignment instead.")
+                    # Fall back to global alignment if no common patients
+                    global_alignment = True
+                else:
+                    global_alignment = False
+            
+            if global_alignment:
+                print("Running global alignment on entire datasets.")
+                # Run global alignment on entire datasets as a single unit
+                             
+                alignments_matrix = get_alignments(
+                    adata1=reordered_adata_sn[:, :self.n_matching_genes],
+                    adata2=adata_st_common,
+                    min_value=align_min_value,
+                    lamb=align_lamb,
+                    layer_type=align_layer_type,
+                    devices=self.devices,
+                    get_edge_probs=save_alignment_matrix,
+                    get_matrix=True,
+                    lr=1e-3,
+                    replace=True,
+                    min_epochs=20,
+                    scale=True,
+                    verbose=verbose
+                )
+                
+                if save_alignment_matrix:
+                    alignments_matrix, alignment_matrix_full = alignments_matrix
+                    np.save('alignment_matrix_two_stage.npy', alignment_matrix_full)
+                
+                alignment_matrix_full = None
+            else:
+                # Run alignment per patient to ensure we only align cells from the same patient
+                sn_patients = reordered_adata_sn.obs[patient_key].unique()
+                st_patients = adata_st_common.obs[patient_key].unique()
+                common_patients = list(set(sn_patients) & set(st_patients))
+                
+                if len(common_patients) == 0:
+                    print(f"Warning: No common patients found. Patients in SN: {sn_patients}, Patients in ST: {st_patients}, running global alignment instead.")
+                    # Fall back to global alignment if no common patients
+                    common_patients = list(sn_patients)
+                
+                # Initialize global alignment matrix
+                alignments_matrix = sp.lil_matrix((reordered_adata_sn.shape[0], adata_st_common.shape[0]), dtype=np.float32)
+                alignment_matrix_full = None
+                
+                # Run alignment for each common patient
+                for patient in common_patients:
+                    sn_idx = reordered_adata_sn.obs[patient_key] == patient
+                    st_idx = adata_st_common.obs[patient_key] == patient
+                    
+                    if sn_idx.sum() == 0 or st_idx.sum() == 0:
+                        print(f"Skipping patient {patient}: SN cells={sn_idx.sum()}, ST cells={st_idx.sum()}")
+                        continue
+                    
+                    # Extract patient-specific data
+                    adata_sn_patient = reordered_adata_sn[sn_idx, :self.n_matching_genes].copy()
+                    adata_st_patient = adata_st_common[st_idx, :].copy()
+                    
+                    print(f"Aligning patient {patient}: SN shape {adata_sn_patient.shape}, ST shape {adata_st_patient.shape}")
+                    
+                    # Run alignment for this patient
+                    patient_align_matrix = get_alignments(
+                        adata1=adata_sn_patient,
+                        adata2=adata_st_patient,
+                        min_value=align_min_value,
+                        lamb=align_lamb,
+                        layer_type=align_layer_type,
+                        devices=self.devices,
+                        get_edge_probs=save_alignment_matrix,
+                        get_matrix=True,
+                        lr=1e-3,
+                        replace=True,
+                        min_epochs=20,
+                        scale=True,
+                        verbose=verbose
+                    )
+                    
+                    if save_alignment_matrix:
+                        patient_align_matrix, patient_align_matrix_full = patient_align_matrix
+                        # Store the full edge probabilities if needed
+                        if alignment_matrix_full is None:
+                            alignment_matrix_full = sp.lil_matrix((reordered_adata_sn.shape[0], adata_st_common.shape[0]), dtype=np.float32)
+                        # Map to global indices
+                        sn_global_idx = np.where(sn_idx)[0]
+                        st_global_idx = np.where(st_idx)[0]
+                        for i in range(patient_align_matrix_full.shape[0]):
+                            for j in range(patient_align_matrix_full.shape[1]):
+                                if patient_align_matrix_full[i, j] != 0:
+                                    alignment_matrix_full[sn_global_idx[i], st_global_idx[j]] = patient_align_matrix_full[i, j]
+                    
+                    # Map patient-specific alignment matrix to global indices
+                    sn_global_idx = np.where(sn_idx)[0]
+                    st_global_idx = np.where(st_idx)[0]
+                    
+                    # Insert patient-specific alignments into global matrix
+                    if sp.issparse(patient_align_matrix):
+                        for i, j in zip(patient_align_matrix.nonzero()[0], patient_align_matrix.nonzero()[1]):
+                            alignments_matrix[sn_global_idx[i], st_global_idx[j]] = patient_align_matrix[i, j]
+                    else:
+                        # Convert to sparse for consistent handling
+                        patient_align_sparse = sp.csr_matrix(patient_align_matrix)
+                        for i, j in zip(patient_align_sparse.nonzero()[0], patient_align_sparse.nonzero()[1]):
+                            alignments_matrix[sn_global_idx[i], st_global_idx[j]] = patient_align_matrix[i, j]
+                
+                # Convert to csr format for efficiency
+                alignments_matrix = alignments_matrix.tocsr()
+                
+                if save_alignment_matrix:
+                    if alignment_matrix_full is not None:
+                        np.save('alignment_matrix_two_stage.npy', alignment_matrix_full.toarray())
+                    else:
+                        np.save('alignment_matrix_two_stage.npy', alignments_matrix.toarray())
+            
             mnn1 , mnn2 = alignments_matrix.nonzero()
         if isinstance(mnn1[0], str):
             mnn1 = reordered_adata_sn.obs_names.get_indexer(mnn1)

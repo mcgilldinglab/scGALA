@@ -1,5 +1,5 @@
 # from numba import jit, float32, int8, boolean
-from scipy.spatial import cKDTree
+from scipy.spatial import KDTree
 from scipy.spatial.distance import cdist
 from sklearn.preprocessing import normalize
 from sklearn.neighbors import kneighbors_graph
@@ -57,8 +57,8 @@ def find_mutual_nn(data1, data2, k1, k2, transformed, n_jobs,verbose=True):
             print('normalization done')
     
     # Build KD-Trees and query nearest neighbors
-    tree1 = cKDTree(data1)
-    tree2 = cKDTree(data2)
+    tree1 = KDTree(data1)
+    tree2 = KDTree(data2)
     if verbose:
         print('tree done')
     k_index_1 = tree1.query(x=data2, k=k1, workers=n_jobs)[1]
@@ -90,7 +90,10 @@ def find_mutual_nn(data1, data2, k1, k2, transformed, n_jobs,verbose=True):
     
     return mutual_1.tolist(), mutual_2.tolist()
 # %%
-def get_graph(data1:AnnData,data2:AnnData,mnn1,mnn2,spatial=False):
+
+def get_graph(data1:AnnData,data2:AnnData,mnn1,mnn2,spatial=False, timeit=True):
+    if timeit:
+        ts = time()
     # Get graph data
     if not spatial:
         edge_1 = kneighbors_graph(data1.obsm['X_pca'], 20, mode='distance').tocoo()
@@ -178,6 +181,10 @@ def get_graph(data1:AnnData,data2:AnnData,mnn1,mnn2,spatial=False):
     x = torch.from_numpy(x).to(torch.float32)
     num_nodes = data1.shape[0] + data2.shape[0]
     
+    if timeit:
+        te = time()
+        print(f'get_graph took: {te-ts:2.4f} sec')
+
     if not spatial:
         return x, edge_index_undirected, bias, num_nodes, edge_type_undirected
     else:

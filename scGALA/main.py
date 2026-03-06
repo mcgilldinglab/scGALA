@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore', '.*deprecated.*')
 torch.set_float32_matmul_precision('medium')
 EPS = 1e-15
 
-def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20, min_value=0.9, default_root_dir=None,max_epochs:int = 30,lamb = 0.3,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',get_latent:bool = False, get_edge_probs:bool = False, get_matrix:bool = True, alignment_version:Literal['v1','v2'] = 'v2',alignment_lr=1e-3,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False, masking_ratio=0.3,inter_edge_mask_weight:float = 0.5, verbose:bool=True):
+def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_dim:int = 32, dropout:float = 0.3, lr:float = 1e-3,min_epochs:int = 10, k:int =20, min_value=0.9, default_root_dir=None,max_epochs:int = 30,lamb = 0.3,ckpt_dir = None, transformed = False, transformed_datas=None, use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',layer_type:Literal['GAT', 'GATv2', 'SAGE', 'ClusterGCN'] = 'GAT', version:Literal['normal','simple','naive'] = 'simple',get_latent:bool = False, get_edge_probs:bool = False, get_matrix:bool = True, alignment_version:Literal['v1','v2'] = 'v2',alignment_lr=1e-3,only_mnn = False,mnns=None,devices=None,replace=False,scale=False,spatial=False, masking_ratio=0.3,inter_edge_mask_weight:float = 0.5, verbose:bool=True):
     '''
     To get the alignments as a matrix showing the possibility of their alignment and the unaligned pairs are set to zero.
     Provide either the dir of adata with data_dirs or directly provide adatas.
@@ -150,7 +150,7 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         sc.pp.scale(data1)
         sc.pp.scale(data2)
     # get latent space data
-    mydatamodule = MyDataModule(adata1 = data1, adata2 = data2,mnn1=mnn1,mnn2=mnn2,spatial=spatial)
+    mydatamodule = MyDataModule(adata1 = data1, adata2 = data2,mnn1=mnn1,mnn2=mnn2,spatial=spatial,verbose=verbose)
     if not spatial:
         early_stopping = EarlyStopping('ap',patience=3,mode='max',min_delta=0.01)#,stopping_threshold=0.95
         Model = MSVGAE_gcl
@@ -161,7 +161,7 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
     print('start to train')
     if ckpt_dir is None:
         # model = VGAE_gcl(out_channels=out_channels,dropout=dropout,lr=lr,use_scheduler=use_scheduler,optimizer=optimizer)
-        model = Model(in_channels=in_channels ,dropout=dropout,lr=lr,masking_ratio=masking_ratio,use_scheduler=use_scheduler,optimizer=optimizer,out_dim=out_dim,version='simple',inter_edge_mask_weight=inter_edge_mask_weight)
+        model = Model(in_channels=in_channels ,dropout=dropout,lr=lr,masking_ratio=masking_ratio,use_scheduler=use_scheduler,optimizer=optimizer,out_dim=out_dim,layer_type=layer_type,version=version,inter_edge_mask_weight=inter_edge_mask_weight)
         start_time = time.time()
         while True:
             try :
@@ -406,7 +406,7 @@ def two_stage_spatial_imputation(
     sn_centroid=None, st_centroid=None, force_recompute=False,
     patient_key='patient', centroid_method='pca',use_scGALA=True,lam_genegraph=0.1,
     adv_weight=0.05, discriminator_hidden=256, discriminator_lr=1e-3,
-    discriminator_steps=1, generator_steps=1,num_workers=8,return_stage_1 = False,stage1_only=False, mixed_precision = False, align_lamb = 0.8
+    discriminator_steps=1, generator_steps=1,num_workers=8,return_stage_1 = False,stage1_only=False, mixed_precision = False, align_lamb = 0.2, align_min_value = 0.8,align_layer_type:Literal['GAT', 'GATv2', 'SAGE', 'ClusterGCN'] = 'GAT',verbose=True
 ):
     """
     Two-stage spatial transcriptomics imputation with similarity preservation
@@ -520,7 +520,10 @@ def two_stage_spatial_imputation(
         use_scGALA=use_scGALA,
         save_alignment_matrix=save_alignment_matrix,
         num_workers=num_workers,
-        align_lamb=align_lamb
+        align_lamb=align_lamb,
+        align_min_value=align_min_value,
+        align_layer_type=align_layer_type,
+        verbose=verbose
     )
     if alignment_matrix is None:
         alignment_matrix = np.load('alignment_matrix_two_stage.npy')

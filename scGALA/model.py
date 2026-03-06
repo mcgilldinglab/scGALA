@@ -209,18 +209,143 @@ class GAT_Encoder_no_hidden(nn.Module):
         z_logstd = self.out_logstd_layer(last_out, edge_index)
 
         return z_mean, z_logstd
+
+
+class GATv2_Encoder(nn.Module):
+    def __init__(self, num_heads, in_channels, latent_dim, hidden_dims=[64,128], dropout=0.4):
+        super(GATv2_Encoder, self).__init__()
+        # initialize parameter
+        self.in_channels = in_channels
+        self.latent_dim = latent_dim
+        self.num_heads = num_heads
+        # initialize GATv2 layers
+        self.hidden_layer_1 = GATv2Conv(
+            in_channels=in_channels, out_channels=hidden_dims[0],
+            heads=self.num_heads[0],
+            dropout=dropout,
+            concat=True)
+        in_dim2 = hidden_dims[0] * self.num_heads[0]
+
+        self.hidden_layer_2 = GATv2Conv(
+            in_channels=in_dim2, out_channels=hidden_dims[1],
+            heads=self.num_heads[1],
+            dropout=dropout,
+            concat=True)
+
+        in_dim_final = hidden_dims[-1] * self.num_heads[1]
+
+        self.out_mean_layer = GATv2Conv(in_channels=in_dim_final, out_channels=self.latent_dim,
+                                        heads=self.num_heads[2], concat=False, dropout=0.4)
+        self.out_logstd_layer = GATv2Conv(in_channels=in_dim_final, out_channels=self.latent_dim,
+                                          heads=self.num_heads[3], concat=False, dropout=0.4)
+
+    def forward(self, x, edge_index):
+        out = self.hidden_layer_1(x, edge_index)
+        out = F.relu(out)
+        out = self.hidden_layer_2(out, edge_index)
+        out = F.relu(out)
+        out = F.dropout(out, p=0.4, training=self.training)
+        last_out = out
+        z_mean = self.out_mean_layer(last_out, edge_index)
+        z_logstd = self.out_logstd_layer(last_out, edge_index)
+
+        return z_mean, z_logstd
+
+
+class SAGE_Encoder(nn.Module):
+    def __init__(self, in_channels, latent_dim, hidden_dims=[64,128], dropout=0.4):
+        super(SAGE_Encoder, self).__init__()
+        # initialize parameter
+        self.in_channels = in_channels
+        self.latent_dim = latent_dim
+        # initialize SAGE layers
+        self.hidden_layer_1 = SAGEConv(in_channels=in_channels, out_channels=hidden_dims[0])
+        self.hidden_layer_2 = SAGEConv(in_channels=hidden_dims[0], out_channels=hidden_dims[1])
+        self.out_mean_layer = SAGEConv(in_channels=hidden_dims[1], out_channels=self.latent_dim)
+        self.out_logstd_layer = SAGEConv(in_channels=hidden_dims[1], out_channels=self.latent_dim)
+        self.dropout = Dropout(dropout)
+
+    def forward(self, x, edge_index):
+        out = self.hidden_layer_1(x, edge_index)
+        out = F.relu(out)
+        out = self.dropout(out)
+        out = self.hidden_layer_2(out, edge_index)
+        out = F.relu(out)
+        out = self.dropout(out)
+        last_out = out
+        z_mean = self.out_mean_layer(last_out, edge_index)
+        z_logstd = self.out_logstd_layer(last_out, edge_index)
+
+        return z_mean, z_logstd
+
+
+class ClusterGCN_Encoder(nn.Module):
+    def __init__(self, in_channels, latent_dim, hidden_dims=[64,128], dropout=0.4):
+        super(ClusterGCN_Encoder, self).__init__()
+        # initialize parameter
+        self.in_channels = in_channels
+        self.latent_dim = latent_dim
+        # initialize ClusterGCN layers
+        self.hidden_layer_1 = ClusterGCNConv(in_channels=in_channels, out_channels=hidden_dims[0])
+        self.hidden_layer_2 = ClusterGCNConv(in_channels=hidden_dims[0], out_channels=hidden_dims[1])
+        self.out_mean_layer = ClusterGCNConv(in_channels=hidden_dims[1], out_channels=self.latent_dim)
+        self.out_logstd_layer = ClusterGCNConv(in_channels=hidden_dims[1], out_channels=self.latent_dim)
+        self.dropout = Dropout(dropout)
+
+    def forward(self, x, edge_index):
+        out = self.hidden_layer_1(x, edge_index)
+        out = F.relu(out)
+        out = self.dropout(out)
+        out = self.hidden_layer_2(out, edge_index)
+        out = F.relu(out)
+        out = self.dropout(out)
+        last_out = out
+        z_mean = self.out_mean_layer(last_out, edge_index)
+        z_logstd = self.out_logstd_layer(last_out, edge_index)
+
+        return z_mean, z_logstd
+
     
 class MSVGAE_gcl(L.LightningModule):
-    def __init__(self,in_channels:int = -1,out_channels:list = [16,32,64],out_dim=64,dropout:float=0.3,lr:float=3e-4, masking_ratio=0.3,use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',version = 'normal',inter_edge_mask_weight:float = 0.5) -> None:
+    def __init__(self,in_channels:int = -1,out_channels:list = [16,32,64],out_dim=64,dropout:float=0.3,lr:float=3e-4, masking_ratio=0.3,use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',version = 'normal',inter_edge_mask_weight:float = 0.5,layer_type:Literal['GAT', 'GATv2', 'SAGE', 'ClusterGCN'] = 'GAT') -> None:
         super().__init__()
         # self.x, self.edge_index, self.edge_weight, self.data = get_graph(data1,data2,k)
         self.lr = lr
-        if version == 'normal':
-            self.model = MSVGAE(nn.ModuleList([GAT_Encoder(num_heads=[4,4,4,4],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]),out_dim=out_dim)
-        if version == 'simple':
-            self.model = MSVGAE(nn.ModuleList([GAT_Encoder(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]),out_dim=out_dim)
-        if version == 'naive':
-            self.model = MSVGAE(nn.ModuleList([GAT_Encoder_no_hidden(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]),out_dim=out_dim)
+        
+        # Create encoder list based on layer_type
+        encoders = []
+        if layer_type == 'GAT':
+            if version == 'normal':
+                encoders = [GAT_Encoder(num_heads=[4,4,4,4],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'simple':
+                encoders = [GAT_Encoder(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'naive':
+                encoders = [GAT_Encoder_no_hidden(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+        elif layer_type == 'GATv2':
+            if version == 'normal':
+                encoders = [GATv2_Encoder(num_heads=[4,4,4,4],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'simple':
+                encoders = [GATv2_Encoder(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'naive':
+                raise ValueError("GATv2 doesn't support 'naive' version without hidden layer")
+        elif layer_type == 'SAGE':
+            if version == 'normal':
+                encoders = [SAGE_Encoder(in_channels=in_channels,latent_dim=out_channels[i], hidden_dims=[64,128], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'simple':
+                encoders = [SAGE_Encoder(in_channels=in_channels,latent_dim=out_channels[i], hidden_dims=[32,64], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'naive':
+                raise ValueError("SAGE doesn't support 'naive' version without hidden layer")
+        elif layer_type == 'ClusterGCN':
+            if version == 'normal':
+                encoders = [ClusterGCN_Encoder(in_channels=in_channels,latent_dim=out_channels[i], hidden_dims=[64,128], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'simple':
+                encoders = [ClusterGCN_Encoder(in_channels=in_channels,latent_dim=out_channels[i], hidden_dims=[32,64], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'naive':
+                raise ValueError("ClusterGCN doesn't support 'naive' version without hidden layer")
+        else:
+            raise ValueError(f"Unsupported layer_type: {layer_type}. Choose from 'GAT', 'GATv2', 'SAGE', 'ClusterGCN'")
+        
+        self.model = MSVGAE(nn.ModuleList(encoders), out_dim=out_dim)
         self.use_scheduler = use_scheduler
         self.optimizer = optimizer
         # self.aug = A.RandomChoice([
@@ -298,16 +423,45 @@ class MSVGAE_gcl(L.LightningModule):
         return z
 
 class MSVGAE_gcl_spatialGW(L.LightningModule):
-    def __init__(self,in_channels:int = -1,out_channels:list = [16,32,64],out_dim=64,dropout:float=0.3,lr:float=3e-4, masking_ratio=0.3,use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',version = 'normal',inter_edge_mask_weight:float = 0.5) -> None:
+    def __init__(self,in_channels:int = -1,out_channels:list = [16,32,64],out_dim=64,dropout:float=0.3,lr:float=3e-4, masking_ratio=0.3,use_scheduler:bool = True,optimizer:Literal['adam','sgd'] = 'adam',version:Literal['normal','simple','naive'] = 'normal',inter_edge_mask_weight:float = 0.5,layer_type:Literal['GAT', 'GATv2', 'SAGE', 'ClusterGCN'] = 'GAT') -> None:
         super().__init__()
         # self.x, self.edge_index, self.edge_weight, self.data = get_graph(data1,data2,k)
         self.lr = lr
-        if version == 'normal':
-            self.model = MSVGAE(nn.ModuleList([GAT_Encoder(num_heads=[4,4,4,4],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]),out_dim=out_dim)
-        if version == 'simple':
-            self.model = MSVGAE(nn.ModuleList([GAT_Encoder(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]),out_dim=out_dim)
-        if version == 'naive':
-            self.model = MSVGAE(nn.ModuleList([GAT_Encoder_no_hidden(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]),out_dim=out_dim)
+        
+        # Create encoder list based on layer_type
+        encoders = []
+        if layer_type == 'GAT':
+            if version == 'normal':
+                encoders = [GAT_Encoder(num_heads=[4,4,4,4],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'simple':
+                encoders = [GAT_Encoder(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'naive':
+                encoders = [GAT_Encoder_no_hidden(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+        elif layer_type == 'GATv2':
+            if version == 'normal':
+                encoders = [GATv2_Encoder(num_heads=[4,4,4,4],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'simple':
+                encoders = [GATv2_Encoder(num_heads=[1,1,1,1],in_channels=in_channels,latent_dim=out_channels[i], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'naive':
+                raise ValueError("GATv2 doesn't support 'naive' version without hidden layer")
+        elif layer_type == 'SAGE':
+            if version == 'normal':
+                encoders = [SAGE_Encoder(in_channels=in_channels,latent_dim=out_channels[i], hidden_dims=[64,128], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'simple':
+                encoders = [SAGE_Encoder(in_channels=in_channels,latent_dim=out_channels[i], hidden_dims=[32,64], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'naive':
+                raise ValueError("SAGE doesn't support 'naive' version without hidden layer")
+        elif layer_type == 'ClusterGCN':
+            if version == 'normal':
+                encoders = [ClusterGCN_Encoder(in_channels=in_channels,latent_dim=out_channels[i], hidden_dims=[64,128], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'simple':
+                encoders = [ClusterGCN_Encoder(in_channels=in_channels,latent_dim=out_channels[i], hidden_dims=[32,64], dropout=dropout) for i in range(len(out_channels))]
+            elif version == 'naive':
+                raise ValueError("ClusterGCN doesn't support 'naive' version without hidden layer")
+        else:
+            raise ValueError(f"Unsupported layer_type: {layer_type}. Choose from 'GAT', 'GATv2', 'SAGE', 'ClusterGCN'")
+        
+        self.model = MSVGAE(nn.ModuleList(encoders), out_dim=out_dim)
         self.use_scheduler = use_scheduler
         self.optimizer = optimizer    
         # Setup the edge augmentor with the specified weight for inter-dataset edges
