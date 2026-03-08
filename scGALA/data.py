@@ -234,9 +234,9 @@ def get_graph_spatial(data1:AnnData,data2:AnnData,mnn1,mnn2,k=20):
     col = np.concatenate([edge_1.col,MNN_col+bias,edge_2.col+bias])
 
     # Create edge type indicator: 0 for intra-dataset edges, 1 for inter-dataset edges
-    intra_edges_1 = np.zeros(len(edge_1.row), dtype=np.int32)
-    intra_edges_2 = np.zeros(len(edge_2.row), dtype=np.int32)
-    inter_edges = np.ones(len(MNN_row), dtype=np.int32)
+    intra_edges_1 = np.zeros(edge_1.row.shape[0], dtype=np.int32)
+    intra_edges_2 = np.zeros(edge_2.row.shape[0], dtype=np.int32)
+    inter_edges = np.ones(MNN_row.shape[0], dtype=np.int32)
     edge_type = np.concatenate([intra_edges_1, inter_edges, intra_edges_2])
     edge_type = torch.from_numpy(edge_type)
 
