@@ -155,7 +155,7 @@ def get_graph(data1:AnnData,data2:AnnData,mnn1,mnn2,spatial=False, timeit=True):
     edge_type = torch.from_numpy(edge_type)
     
     # Convert to undirected and propagate edge types accordingly
-    edge_index_undirected = to_undirected(edge_index).to(torch.int32)
+    edge_index_undirected = to_undirected(edge_index).to(torch.int64)
     
     # Propagate edge types to undirected edges (preserve inter-dataset status)
     edge_type_dict = {}
@@ -189,8 +189,8 @@ def get_graph(data1:AnnData,data2:AnnData,mnn1,mnn2,spatial=False, timeit=True):
         return x, edge_index_undirected, bias, num_nodes, edge_type_undirected
     else:
         # For spatial edge index, also create edge types
-        spatial_edge_index_undirected = to_undirected(spatial_edge_index).to(torch.int32)
-        spatial_edge_type_undirected = torch.zeros(spatial_edge_index_undirected.shape[1], dtype=torch.int32)
+        spatial_edge_index_undirected = to_undirected(spatial_edge_index).to(torch.int64)
+        spatial_edge_type_undirected = torch.zeros(spatial_edge_index_undirected.shape[1], dtype=torch.int64)
         return x, edge_index_undirected, bias, num_nodes, C1, C2, spatial_edge_index_undirected, edge_type_undirected, spatial_edge_type_undirected
 
 def make_alignments_old(latent:torch.Tensor,mnn1:list,mnn2:list,bias:int,lamb:float,min_ppf=0.95,min_percentile:int = 0,min_value:float =0,percent=80,replace=False):

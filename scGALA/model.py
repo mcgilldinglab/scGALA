@@ -466,12 +466,12 @@ class MSVGAE_gcl_spatialGW(L.LightningModule):
         self.optimizer = optimizer    
         # Setup the edge augmentor with the specified weight for inter-dataset edges
         self.edge_augmentor = TypedEdgeRemoving( inter_pe=inter_edge_mask_weight, total_pe=masking_ratio)
-        try:
-            import ot
-            self.ot = ot
-        except ImportError:
-            raise ImportError('\nplease install pot:\n\tpip install POT')
-        # Define the triplet margin loss criterion
+        # try:
+        #     import ot
+        #     self.ot = ot
+        # except ImportError:
+        #     raise ImportError('\nplease install pot:\n\tpip install POT')
+        # # Define the triplet margin loss criterion
         self.criterion = nn.TripletMarginLoss(margin=1.0)
     def training_step(self, batch, batch_idx):
         if len(batch) == 9:  # Updated format with edge types

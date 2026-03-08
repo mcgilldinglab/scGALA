@@ -68,9 +68,9 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
     optimizer : str in ['adam','sgd'], default='adam'
         Optimizer choice
     get_edge_probs : bool, default=False
-        Return raw edge probabilities
+        Return raw edge probabilities as sparse CSR matrix
     get_matrix : bool, default=True
-        Return alignment matrix
+        Return alignment matrix as sparse CSR matrix
     only_mnn : bool, default=False
         Only return MNN pairs without neural network
     mnns : list, optional
@@ -93,8 +93,10 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
 
     Returns
     -------
-    ndarray
-        Matrix of alignment probabilities between cells in the two datasets
+    sparse.csr_matrix or tuple
+        Compressed sparse matrix of alignment probabilities. Can save to disk using:
+        `scipy.sparse.save_npz('filename.npz', matrix)` and load with
+        `scipy.sparse.load_npz('filename.npz')`
     '''
     if not verbose:
         # Suppress warnings
@@ -222,6 +224,8 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         likelyhood = torch.matmul(latent[:bias], latent[bias:].T).sigmoid()
         likelyhood = np.array(likelyhood.detach().cpu()) # [data1.shape[0],data2.shape[0]]
         likelyhood[likelyhood < min_value] = 0
+        # Compress to sparse format
+        likelyhood = sp.csr_matrix(likelyhood)
     # make alignment through score-based greedy algorithm
     if get_matrix:
         if alignment_version=='v1':
@@ -229,6 +233,9 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         elif alignment_version=='v2':
             alignments_matrix = make_alignments_v2(latent=latent,mnn1=mnn1,mnn2=mnn2,bias=bias,lamb=lamb,min_value=min_value,replace=replace,lr=alignment_lr,devices=devices)
         print(f'R:{data1.shape[0]} D:{data2.shape[0]}')
+        # Compress to sparse format if not already
+        if not sp.issparse(alignments_matrix):
+            alignments_matrix = sp.csr_matrix(alignments_matrix)
     
     if get_matrix and not get_edge_probs:
         return alignments_matrix
@@ -264,10 +271,10 @@ def get_match_scanorama(data1, data2,transformed_datas=None,ckpt_dir = None,only
     adata2 = AnnData(X=data2.toarray().astype(np.float32))
     alignments_matrix = get_alignments(adata1=adata1,adata2=adata2,transformed = False,ckpt_dir = ckpt_dir,lr=1e-3,min_percentile=0,min_value=0.8,lamb=0.2,k=20,default_root_dir='./Logs/scanorama/',only_mnn=only_mnn,mnns=[mnn1,mnn2],devices=devices,scale=True)
     mutual = set()
-    for i in range(alignments_matrix.shape[0]):
-        for j in range(alignments_matrix.shape[1]):
-            if alignments_matrix[i,j]>0:
-                mutual.add((i,j))
+    # Use nonzero() for efficient sparse matrix iteration
+    i_indices, j_indices = alignments_matrix.nonzero()
+    for i, j in zip(i_indices, j_indices):
+        mutual.add((i, j))
     return mutual
 
 def mnn_tnn(ds1, ds2, names1, names2, knn = 20,lr=1e-3,default_root_dir='./Logs/tnn_supervised/',min_ppf=0.85,min_percentile=95, min_value=0.8,percent=50,lamb = 0.3,transformed=False,transformed_datas=None,ckpt_dir=None,optimizer:Literal['adam','sgd'] = 'adam',only_mnn=False,match=None,devices=[1],scale=False):
@@ -288,10 +295,10 @@ def mnn_tnn(ds1, ds2, names1, names2, knn = 20,lr=1e-3,default_root_dir='./Logs/
         adata2 = AnnData(X=ds2.astype(np.float32))
         alignments_matrix = get_alignments(adata1=adata1,adata2=adata2,k=knn,transformed = transformed,transformed_datas= transformed_datas,ckpt_dir = ckpt_dir,lr=lr,    default_root_dir=default_root_dir,min_ppf=min_ppf,min_percentile=min_percentile,min_value=min_value,percent=percent,lamb=lamb,optimizer=optimizer,only_mnn=only_mnn,scale=scale,devices=devices)
     mutual = set()
-    for i in range(alignments_matrix.shape[0]):
-        for j in range(alignments_matrix.shape[1]):
-            if alignments_matrix[i,j]>0:
-                mutual.add((names1[i],names2[j]))
+    # Use nonzero() for efficient sparse matrix iteration
+    i_indices, j_indices = alignments_matrix.nonzero()
+    for i, j in zip(i_indices, j_indices):
+        mutual.add((names1[i],names2[j]))
     return mutual
 
 def mnn_scDML(ds1, ds2, names1, names2, knn=20,match=None,ckpt_dir = None,only_mnn=False,devices=[1]):
@@ -370,10 +377,10 @@ def mnn_tnn_spatial(ds1, ds2, spatial1,spatial2, names1, names2, knn = 20,lr=1e-
         adata2.obsm['spatial'] = spatial2
         alignments_matrix = get_alignments(adata1=adata1,adata2=adata2,k=knn,transformed = transformed,transformed_datas= transformed_datas,ckpt_dir = ckpt_dir,lr=lr,    default_root_dir=default_root_dir,min_ppf=min_ppf,min_percentile=min_percentile,min_value=min_value,percent=percent,lamb=lamb,optimizer=optimizer,only_mnn=only_mnn,scale=scale,devices=devices,spatial=True)
     mutual = set()
-    for i in range(alignments_matrix.shape[0]):
-        for j in range(alignments_matrix.shape[1]):
-            if alignments_matrix[i,j]>0:
-                mutual.add((names1[i],names2[j]))
+    # Use nonzero() for efficient sparse matrix iteration
+    i_indices, j_indices = alignments_matrix.nonzero()
+    for i, j in zip(i_indices, j_indices):
+        mutual.add((names1[i],names2[j]))
     return mutual
 
 def mod_seurat_anchors(anchors_ori="temp/anchors.csv",adata1='temp/adata1.h5ad',adata2='temp/adata2.h5ad',min_value=0.8,lamb=0.3,devices=[2],lr=1e-3,replace=True,default_root_dir='./Logs/SeuratMod'):
@@ -526,7 +533,15 @@ def two_stage_spatial_imputation(
         verbose=verbose
     )
     if alignment_matrix is None:
-        alignment_matrix = np.load('alignment_matrix_two_stage.npy')
+        # Load sparse matrix saved from get_alignments()
+        # Note: Matrices are now saved as .npz using scipy.sparse.save_npz()
+        if os.path.exists('alignment_matrix_two_stage.npz'):
+            alignment_matrix = sp.load_npz('alignment_matrix_two_stage.npz')
+        elif os.path.exists('alignment_matrix_two_stage.npy'):
+            # Legacy support for old dense format
+            alignment_matrix = sp.csr_matrix(np.load('alignment_matrix_two_stage.npy'))
+        else:
+            alignment_matrix = None
     # profiler = AdvancedProfiler(dirpath=".", filename="perf_logs")
     # Initialize model
     if stage1_checkpoint is not None:

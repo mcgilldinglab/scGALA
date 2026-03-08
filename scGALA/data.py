@@ -517,7 +517,8 @@ class TwoStageDataModule(L.LightningDataModule):
                 
                 if save_alignment_matrix:
                     alignments_matrix, alignment_matrix_full = alignments_matrix
-                    np.save('alignment_matrix_two_stage.npy', alignment_matrix_full)
+                    # Save sparse matrix in compressed format
+                    sp.save_npz('alignment_matrix_two_stage.npz', alignment_matrix_full)
                 
                 alignment_matrix_full = None
             else:
@@ -572,13 +573,12 @@ class TwoStageDataModule(L.LightningDataModule):
                         # Store the full edge probabilities if needed
                         if alignment_matrix_full is None:
                             alignment_matrix_full = sp.lil_matrix((reordered_adata_sn.shape[0], adata_st_common.shape[0]), dtype=np.float32)
-                        # Map to global indices
+                        # Map to global indices using sparse matrix operations
                         sn_global_idx = np.where(sn_idx)[0]
                         st_global_idx = np.where(st_idx)[0]
-                        for i in range(patient_align_matrix_full.shape[0]):
-                            for j in range(patient_align_matrix_full.shape[1]):
-                                if patient_align_matrix_full[i, j] != 0:
-                                    alignment_matrix_full[sn_global_idx[i], st_global_idx[j]] = patient_align_matrix_full[i, j]
+                        # Efficiently iterate over nonzero elements of sparse matrix
+                        for i, j in zip(patient_align_matrix_full.nonzero()[0], patient_align_matrix_full.nonzero()[1]):
+                            alignment_matrix_full[sn_global_idx[i], st_global_idx[j]] = patient_align_matrix_full[i, j]
                     
                     # Map patient-specific alignment matrix to global indices
                     sn_global_idx = np.where(sn_idx)[0]
@@ -599,9 +599,11 @@ class TwoStageDataModule(L.LightningDataModule):
                 
                 if save_alignment_matrix:
                     if alignment_matrix_full is not None:
-                        np.save('alignment_matrix_two_stage.npy', alignment_matrix_full.toarray())
+                        # Save sparse matrix in compressed format
+                        sp.save_npz('alignment_matrix_two_stage.npz', alignment_matrix_full)
                     else:
-                        np.save('alignment_matrix_two_stage.npy', alignments_matrix.toarray())
+                        # Save sparse matrix in compressed format
+                        sp.save_npz('alignment_matrix_two_stage.npz', alignments_matrix)
             
             mnn1 , mnn2 = alignments_matrix.nonzero()
         if isinstance(mnn1[0], str):
