@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
 import pytorch_lightning as pl
+from scipy import sparse as sp
 from torch_geometric.nn import (
     GCNConv,
     GATConv,
@@ -1238,6 +1239,9 @@ class TwoStageGNNImputer(L.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["alignment_matrix"])
         if alignment_matrix is not None:
+            # Convert sparse matrices to dense before creating tensor
+            if sp.issparse(alignment_matrix):
+                alignment_matrix = alignment_matrix.toarray()
             cpu_matrix = torch.as_tensor(alignment_matrix, dtype=torch.float32)
             self.register_buffer("alignment_matrix_cpu", cpu_matrix, persistent=False)
         else:
