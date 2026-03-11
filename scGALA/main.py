@@ -144,9 +144,10 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
             return np.zeros((data1.shape[0],data2.shape[0]))
     
     if only_mnn:
-        marriage_choices = np.zeros((data1.shape[0],data2.shape[0]))
-        for i,j in zip(mnn1,mnn2):
-            marriage_choices[i,j] = 1
+        row = np.array(mnn1)
+        col = np.array(mnn2)
+        data = np.ones(len(mnn1))
+        marriage_choices = sp.csr_matrix((data, (row, col)), shape=(data1.shape[0], data2.shape[0]))
         return marriage_choices
     if scale:
         sc.pp.scale(data1)
@@ -221,11 +222,39 @@ def get_alignments(data1_dir=None, data2_dir=None,adata1=None,adata2=None, out_d
         return latent
     # show edge_prob
     if get_edge_probs:
-        likelyhood = torch.matmul(latent[:bias], latent[bias:].T).sigmoid()
-        likelyhood = np.array(likelyhood.detach().cpu()) # [data1.shape[0],data2.shape[0]]
-        likelyhood[likelyhood < min_value] = 0
-        # Compress to sparse format
-        likelyhood = sp.csr_matrix(likelyhood)
+        latent_sn = latent[:bias]
+        latent_st = latent[bias:]
+        
+        # Memory efficient chunked computation for large matrices
+        if latent_sn.shape[0] * latent_st.shape[0] > 1e7:  # > 10M elements
+            rows, cols, data = [], [], []
+            chunk_size = 5000
+            for i in range(0, latent_sn.shape[0], chunk_size):
+                end_i = min(i + chunk_size, latent_sn.shape[0])
+                sim = torch.matmul(latent_sn[i:end_i], latent_st.t()).sigmoid()
+                mask = sim >= min_value
+                idx = torch.nonzero(mask)
+                if idx.numel() > 0:
+                    rows.append(idx[:, 0].cpu().numpy() + i)
+                    cols.append(idx[:, 1].cpu().numpy())
+                    data.append(sim[mask].cpu().numpy())
+                del sim, mask, idx
+                torch.cuda.empty_cache()
+            
+            if len(rows) > 0:
+                rows = np.concatenate(rows)
+                cols = np.concatenate(cols)
+                data = np.concatenate(data)
+                likelyhood = sp.csr_matrix((data, (rows, cols)), 
+                                         shape=(latent_sn.shape[0], latent_st.shape[0]))
+            else:
+                likelyhood = sp.csr_matrix((latent_sn.shape[0], latent_st.shape[0]))
+        else:
+            likelyhood = torch.matmul(latent_sn, latent_st.t()).sigmoid()
+            likelyhood = np.array(likelyhood.detach().cpu()) # [data1.shape[0],data2.shape[0]]
+            likelyhood[likelyhood < min_value] = 0
+            # Compress to sparse format
+            likelyhood = sp.csr_matrix(likelyhood)
     # make alignment through score-based greedy algorithm
     if get_matrix:
         if alignment_version=='v1':

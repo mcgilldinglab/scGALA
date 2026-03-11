@@ -1239,18 +1239,23 @@ class TwoStageGNNImputer(L.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["alignment_matrix"])
         if alignment_matrix is not None:
-            # Convert sparse matrices to dense before creating tensor
+            # Keep sparse matrices sparse to save memory
             if sp.issparse(alignment_matrix):
-                alignment_matrix = alignment_matrix.toarray()
-            cpu_matrix = torch.as_tensor(alignment_matrix, dtype=torch.float32)
+                alignment_matrix = alignment_matrix.tocoo()
+                indices = torch.from_numpy(np.vstack((alignment_matrix.row, alignment_matrix.col)).astype(np.int64))
+                values = torch.from_numpy(alignment_matrix.data.astype(np.float32))
+                shape = torch.Size(alignment_matrix.shape)
+                cpu_matrix = torch.sparse_coo_tensor(indices, values, shape)
+            else:
+                cpu_matrix = torch.as_tensor(alignment_matrix, dtype=torch.float32)
             self.register_buffer("alignment_matrix_cpu", cpu_matrix, persistent=False)
         else:
             self.register_buffer("alignment_matrix_cpu", None, persistent=False)
-        
+
         # Main imputation model
         self.imputer = GNNImputer(num_features=num_features, n_matching_genes=n_matching_genes, hidden_channels=hidden_channels, 
                                   num_layers=num_layers, layer_type=layer_type, dropout=dropout, learning_rate=lr)
-        
+
         # Two-stage training parameters
         self.stage1_epochs = stage1_epochs
         self.similarity_weight = similarity_weight
@@ -1272,7 +1277,7 @@ class TwoStageGNNImputer(L.LightningModule):
         self.stage2_best_loss = float('inf')
         self.stage2_wait = 0
         self.stage2_stopped = False
-        
+
         # For storing intermediate results
         self.stage1_complete = False
         self.sn_indices = None
@@ -1306,19 +1311,20 @@ class TwoStageGNNImputer(L.LightningModule):
             raise ValueError("sn_size and st_size must be positive integers.")
         self.sn_indices = torch.arange(sn_size)
         self.st_indices = torch.arange(sn_size, sn_size + st_size)
-        
+
     def forward(self, x, edge_index):
         return self.imputer(x, edge_index)
-    
+
     def compute_alignment_matrices(self, sn_data, st_data):
         """Compute alignment matrices using scGALA's get_alignments function"""
         from .main import get_alignments
-        
+
         # Create temporary AnnData objects
         sn_adata = ad.AnnData(X=sn_data.detach().cpu().numpy())
         st_adata = ad.AnnData(X=st_data.detach().cpu().numpy())
-        
+
         # Get alignment matrix using scGALA
+        # We only want edge probabilities for similarity preservation loss
         alignment_matrix = get_alignments(
             adata1=sn_adata, 
             adata2=st_adata,
@@ -1327,6 +1333,7 @@ class TwoStageGNNImputer(L.LightningModule):
             lr=self.alignment_lr,
             max_epochs=10,  # Fewer epochs for efficiency
             get_edge_probs=True,
+            get_matrix=False,  # Important: only get raw edge probs as a single sparse matrix
             scale=True,
             devices=self.alignment_devices,
             default_root_dir='./logs/scgala_alignment',
@@ -1336,22 +1343,49 @@ class TwoStageGNNImputer(L.LightningModule):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-        
+
         # Clean up temporary AnnData objects
         del sn_adata, st_adata
         gc.collect()
-        
+
         print('Alignment matrix computed at epoch:', self.current_epoch_stage)
-        return torch.tensor(alignment_matrix, device=self.device, dtype=torch.float32)
-    
+
+        if sp.issparse(alignment_matrix):
+            alignment_matrix = alignment_matrix.tocoo()
+            indices = torch.from_numpy(np.vstack((alignment_matrix.row, alignment_matrix.col)).astype(np.int64))
+            values = torch.from_numpy(alignment_matrix.data.astype(np.float32))
+            shape = torch.Size(alignment_matrix.shape)
+            return torch.sparse_coo_tensor(indices, values, shape).to(self.device)
+        else:
+            return torch.tensor(alignment_matrix, device=self.device, dtype=torch.float32)
+    @staticmethod
+    def _sparse_row_normalize(sparse_tensor):
+        """Row-normalize a sparse or dense tensor"""
+        if not sparse_tensor.is_sparse:
+            return F.normalize(sparse_tensor, p=1, dim=1)
+
+        # For COO sparse tensors
+        sparse_tensor = sparse_tensor.coalesce()
+        indices = sparse_tensor.indices()
+        values = sparse_tensor.values()
+
+        # Compute row sums
+        row_sums = torch.zeros(sparse_tensor.size(0), device=sparse_tensor.device)
+        row_sums.scatter_add_(0, indices[0], values)
+
+        # Divide by row sums
+        normalized_values = values / row_sums[indices[0]].clamp(min=EPS)
+
+        return torch.sparse_coo_tensor(indices, normalized_values, sparse_tensor.size())
+
     def compute_similarity_matrices(self, data, k=20, sparse=True):
         """Compute sparse pairwise similarity matrices using cosine similarity with K-NN, preserving gradients."""
         # Normalize data
         data_norm = F.normalize(data, p=2, dim=1)
-        
+
         # Compute full cosine similarity for finding K-NN
         full_similarity = torch.mm(data_norm, data_norm.t())
-        
+
         if sparse:
             # Find top-k similarities for each node (including self)
             topk_values, topk_indices = torch.topk(full_similarity, k=k+1, dim=1, largest=True)
@@ -1368,9 +1402,9 @@ class TwoStageGNNImputer(L.LightningModule):
             similarity = full_similarity
         # Make symmetric by taking max(sim[i,j], sim[j,i])
         similarity = torch.max(similarity, similarity.t())
-        
+
         return similarity
-    
+
     def compute_similarity_loss(self, sn_data, st_data):
         """Compute similarity preservation loss"""
         # Get alignment probabilities between SN and ST
@@ -1378,8 +1412,8 @@ class TwoStageGNNImputer(L.LightningModule):
             sn_st_alignment = self.alignment_matrix_cpu.to(self.device, non_blocking=True)
             st_sn_alignment = sn_st_alignment.t()
             # Row-normalize alignment matrices (each row sums to 1)
-            self.st_sn_alignment_norm = F.normalize(st_sn_alignment, p=1, dim=1).detach().to(self.device)
-            self.sn_st_alignment_norm = F.normalize(sn_st_alignment, p=1, dim=1).detach().to(self.device)
+            self.st_sn_alignment_norm = self._sparse_row_normalize(st_sn_alignment).detach().to(self.device)
+            self.sn_st_alignment_norm = self._sparse_row_normalize(sn_st_alignment).detach().to(self.device)
             del sn_st_alignment, st_sn_alignment, self.alignment_matrix_cpu  # Free memory
 
         # Compute similarity matrices
@@ -1390,34 +1424,45 @@ class TwoStageGNNImputer(L.LightningModule):
                 self.sn_sn_similarity_cpu.flatten().unsqueeze(0), p=2, dim=1
             )
         sn_sn_similarity = self.sn_sn_similarity_cpu.to(self.device, non_blocking=True)
-            
+
         st_st_similarity = self.compute_similarity_matrices(st_data, sparse=False,k=20).to(self.device)
-        
+
         # Expected ST-ST similarity based on SN-SN similarity and SN-ST alignment
         # expected_st_st = ST-SN @ SN-SN @ SN-ST
-        
+
         if not hasattr(self, 'expected_norm_st'):
-            expected_st = torch.mm(
-                torch.mm(self.st_sn_alignment_norm, sn_sn_similarity),
-                self.sn_st_alignment_norm
-            )
+            if self.st_sn_alignment_norm.is_sparse:
+                # Use sparse-dense multiplication
+                temp = torch.sparse.mm(self.st_sn_alignment_norm, sn_sn_similarity)
+                # (temp @ sparse) = (sparse.t() @ temp.t()).t()
+                expected_st = torch.sparse.mm(self.sn_st_alignment_norm.t(), temp.t()).t()
+            else:
+                expected_st = torch.mm(
+                    torch.mm(self.st_sn_alignment_norm, sn_sn_similarity),
+                    self.sn_st_alignment_norm
+                )
             self.expected_norm_st = F.normalize(
                 expected_st.flatten().unsqueeze(0), p=2, dim=1
             ).cpu()
-        expected_sn_sn_similarity = torch.mm(
-            torch.mm(self.sn_st_alignment_norm, st_st_similarity), 
-            self.st_sn_alignment_norm
-        )
-        
+
+        if self.sn_st_alignment_norm.is_sparse:
+            temp_sn = torch.sparse.mm(self.sn_st_alignment_norm, st_st_similarity)
+            expected_sn_sn_similarity = torch.sparse.mm(self.st_sn_alignment_norm.t(), temp_sn.t()).t()
+        else:
+            expected_sn_sn_similarity = torch.mm(
+                torch.mm(self.sn_st_alignment_norm, st_st_similarity), 
+                self.st_sn_alignment_norm
+            )
+
         # Compute cosine similarity between expected and actual ST-ST similarities
-        
+
         actual_flat_st = st_st_similarity.flatten()
         expected_flat_sn = expected_sn_sn_similarity.flatten()
-        
+
         # Normalize vectors
         actual_norm_st = F.normalize(actual_flat_st.unsqueeze(0), p=2, dim=1)
         expected_norm_sn = F.normalize(expected_flat_sn.unsqueeze(0), p=2, dim=1)
-        
+
         expected_norm_st = self.expected_norm_st.to(self.device, non_blocking=True)
         # Compute cosine similarity (we want to maximize this, so minimize 1 - similarity)
         cosine_sim_st = F.cosine_similarity(expected_norm_st, actual_norm_st, dim=1)
@@ -1425,8 +1470,7 @@ class TwoStageGNNImputer(L.LightningModule):
         cosine_sim_sn = F.cosine_similarity(expected_norm_sn, self.actual_norm_sn.to(self.device, non_blocking=True), dim=1)
         similarity_loss_sn = 1 - cosine_sim_sn.mean()
 
-        return similarity_loss_st, similarity_loss_sn
-    
+        return similarity_loss_st, similarity_loss_sn    
     def compute_triplet_loss(self, embeddings, edge_index):
         edge_index = edge_index.to(embeddings.device)
         if edge_index.numel() == 0:
